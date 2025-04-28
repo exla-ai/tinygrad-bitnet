@@ -14,20 +14,27 @@ def activation_quant(x: Tensor) -> Tensor:
 
 # Weight Quantization (1.58-bit absmean -> {-1, 0, +1} * scale)
 def weight_quant(w: Tensor) -> Tensor:
-    # Calculate scale: global absolute mean (beta) for the entire weight matrix W
-    # Paper: "scaled by β = E[|W|]"
-    scale = w.abs().mean().expand_as(w) # Calculate mean, then expand to weight shape for STE
+  """
+  Quantize weights to {-1, 0, 1} (1.58 bits) using the RoundClip method
+  from the BitNet b1.58 paper, scaled by the absolute mean (beta).
+  Uses STE for gradient propagation.
+  """
+  # Calculate scale: global absolute mean (beta)
+  # Paper: "scaled by β = E[|W|]"
+  beta = w.abs().mean()
 
-    # Ternarize: Map values to -1 or +1 based on sign.
-    # Paper implies {-1, 0, +1}, but threshold for 0 is unclear.
-    # Using sign() first as a simplification, then scale by beta.
-    w_ternary_scaled = w.sign() * scale # Values become {-scale, +scale}
+  # Normalize by beta (add clip for numerical stability)
+  w_normalized = w / beta.clip(1e-5, float('inf'))
 
-    # STE (Straight-Through Estimator)
-    # Add the difference between the quantized version and the original, but detach the gradient path
-    # This allows gradients to flow through the original weight during backprop (if training)
-    # For inference, it effectively uses w_ternary_scaled in the forward pass.
-    return w + (w_ternary_scaled - w).detach()
+  # RoundClip: Round to nearest integer, then clip to [-1, 1]
+  w_b = w_normalized.round().clip(-1, 1)
+
+  # Quantized weight for forward pass (used in STE)
+  w_quant = w_b * beta
+
+  # STE (Straight-Through Estimator)
+  # Add the difference between the quantized version and the original, but detach the gradient path
+  return w + (w_quant - w).detach()
 
 # BitLinear Layer (Tinygrad implementation)
 class BitLinear(nn.Linear):
@@ -39,8 +46,14 @@ class BitLinear(nn.Linear):
     """
     Forward pass of the BitLinear layer.
     Applies STE for both activation and weight quantization.
+    Scales the output by the input RMSNorm scale (gamma).
     """
     w = self.weight
+
+    # Calculate input RMS scale (gamma) before quantization
+    # Note: LayerNorm is applied *before* this layer in the TransformerBlock
+    # We calculate gamma based on the already normalized input 'x'
+    gamma = (x.pow(2).mean(-1, keepdim=True) + 1e-6).sqrt() # Add eps for stability
 
     # Quantize activations (absmax) with STE
     # Assumes input 'x' is already normalized
@@ -51,7 +64,10 @@ class BitLinear(nn.Linear):
 
     # Perform linear operation using quantized activations and weights
     # nn.Linear weight is (out_features, in_features), requires transpose
-    return x_quant @ w_quant.T
+    out = x_quant @ w_quant.T
+
+    # Scale the output by gamma
+    return out * gamma
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
@@ -302,6 +318,7 @@ def convert_from_huggingface(weights: dict[str, Tensor], model, n_heads: int, n_
         **{f"model.layers.{l}.mlp.up_proj.weight": f"layers.{l}.feed_forward.w3.weight" for l in range(len(model.layers))},
         **{f"model.layers.{l}.mlp.down_proj.weight": f"layers.{l}.feed_forward.w2.weight" for l in range(len(model.layers))},
         "model.norm.weight": "norm.weight",
+        "lm_head.weight": "output.weight"
     }
 
     sd: dict[str, Tensor] = {}
