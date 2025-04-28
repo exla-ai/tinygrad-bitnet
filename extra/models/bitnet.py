@@ -46,17 +46,15 @@ class BitLinear(nn.Linear):
     """
     Forward pass of the BitLinear layer.
     Applies STE for both activation and weight quantization.
-    Scales the output by the input RMSNorm scale (gamma).
+    Assumes input 'x' is already normalized by a preceding LayerNorm/RMSNorm.
     """
     w = self.weight
 
-    # Calculate input RMS scale (gamma) before quantization
-    # Note: LayerNorm is applied *before* this layer in the TransformerBlock
-    # We calculate gamma based on the already normalized input 'x'
-    gamma = (x.pow(2).mean(-1, keepdim=True) + 1e-6).sqrt() # Add eps for stability
+    # Input 'x' is assumed to be already normalized.
+    # The 'activation_quant' function handles its own necessary scaling (absmax).
+    # gamma = (x.pow(2).mean(-1, keepdim=True) + 1e-6).sqrt() # REMOVED: Redundant calculation on normalized input.
 
     # Quantize activations (absmax) with STE
-    # Assumes input 'x' is already normalized
     x_quant = x + (activation_quant(x) - x).detach()
 
     # Quantize weights (absmean) with STE
@@ -66,8 +64,8 @@ class BitLinear(nn.Linear):
     # nn.Linear weight is (out_features, in_features), requires transpose
     out = x_quant @ w_quant.T
 
-    # Scale the output by gamma
-    return out * gamma
+    # return out * gamma # REMOVED: Scaling is handled by normalization before this layer and/or activation quant.
+    return out
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:

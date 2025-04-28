@@ -232,7 +232,7 @@ if __name__ == "__main__":
   parser = argparse.ArgumentParser(description="Run BitNet", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
   parser.add_argument("--download_model", action="store_true", help="Download the model specified by --model if it doesn't exist")
   parser.add_argument("--model", type=Path, help="Path to the model directory or file")
-  parser.add_argument("--size", type=str, default="2B", choices=['2B', '3B'], help="Size of model to use")
+  parser.add_argument("--size", type=str, default="2B", choices=['2B'], help="Size of model to use")
   parser.add_argument("--shard", type=int, default=1, help="Number of shards to use")
   parser.add_argument("--quantize", type=str, choices=['int8', 'nf4', 'float16'], default=None, help="Quantize the weights to the specified type")
   parser.add_argument("--no_api", action="store_true", help="Do not start the Gradio API")
