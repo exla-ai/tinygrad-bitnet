@@ -170,6 +170,7 @@ class Transformer:
     self.max_context = max_context
     self.freqs_cis = precompute_freqs_cis(dim // n_heads, self.max_context * 2, rope_theta).contiguous()
     self.forward_jit = TinyJit(self.forward) if jit else None
+    self.dim = dim
 
   def forward(self, tokens:Tensor, start_pos:Union[Variable,int], temperature:float, top_k:int, top_p:float, alpha_f:float, alpha_p:float):
     _bsz, seqlen = tokens.shape
@@ -192,50 +193,120 @@ class Transformer:
 
 # *** helpers ***
 
-# TODO: model shouldn't be an input here, and n_kv_heads should support None
-def convert_from_huggingface(weights:dict[str, Tensor], model: Transformer, n_gheads: int, n_kv_heads: int, permute_layers: bool = True):
-  # huggingface stores Q and K permuted! it is mostly correct without this, but without it makes RoPE different, so it will diverge after 10+ toks.
-  def permute(v: Tensor, n_heads: int):
-    return v.reshape(n_heads, 2, v.shape[0] // n_heads // 2, v.shape[1] if len(v.shape) > 1 else 1).transpose(1, 2).reshape(*v.shape[:2])
+import collections
+from tinygrad import dtypes, Device, Tensor
+from tinygrad.helpers import DEBUG
 
+def convert_from_huggingface(weights: dict[str, Tensor], model, n_gheads: int, n_kv_heads: int, permute_layers: bool = True) -> dict[str, Tensor]:
+    """
+    Convert HuggingFace BitNet safetensors weights to Tinygrad Transformer state dict.
+    Args:
+      weights: source weight dict from HuggingFace (safetensors).
+      model: instance of Tinygrad Transformer (for layer count reference).
+      n_gheads: number of global heads in the model (n_heads).
+      n_kv_heads: number of key/value heads (n_kv_heads).
+      permute_layers: whether to permute Q/K weight layouts.
+    Returns:
+      sd: target state dict mapping Tinygrad param names to Tensors.
+    """
+    def permute(v: Tensor, n_heads: int) -> Tensor:
+        # HF stores Q/K in [heads, 2, dim/2, in_dim] order, we need to reshape back
+        shape = v.shape
+        v = v.reshape(n_heads, 2, shape[0] // n_heads // 2, shape[1] if len(shape) > 1 else 1)
+        v = v.transpose(1, 2)
+        return v.reshape(*shape)
 
-  keymap = {
-    # Embeddings
-    "model.embed_tokens.weight": "tok_embeddings.weight",
-    # Attention Norms & Projections (Weights & Scales)
-    **{f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.self_attn.{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "o"] for l in range(len(model.layers))},
-    **{f"model.layers.{l}.self_attn.{x}_proj.weight_scale": f"layers.{l}.attention.w{x}.scale" for x in ["q", "k", "v", "o"] for l in range(len(model.layers))},
-    **{f"model.layers.{l}.post_attention_layernorm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
-    # Map gate_proj -> w1, up_proj -> w3, down_proj -> w2 for SwiGLU
-    **{f"model.layers.{l}.mlp.gate_proj.weight": f"layers.{l}.feed_forward.w1.weight" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.mlp.gate_proj.weight_scale": f"layers.{l}.feed_forward.w1.scale" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.mlp.up_proj.weight": f"layers.{l}.feed_forward.w3.weight" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.mlp.up_proj.weight_scale": f"layers.{l}.feed_forward.w3.scale" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.mlp.down_proj.weight": f"layers.{l}.feed_forward.w2.weight" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.mlp.down_proj.weight_scale": f"layers.{l}.feed_forward.w2.scale" for l in range(len(model.layers))},
-    # Sub norm weights
-    **{f"model.layers.{l}.mlp.ffn_sub_norm.weight": f"layers.{l}.feed_forward.ffn_sub_norm.weight" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.self_attn.attn_sub_norm.weight": f"layers.{l}.attention.attn_sub_norm.weight" for l in range(len(model.layers))},
-    # Final Norm
-    "model.norm.weight": "norm.weight",
-  }
+    # Map HF keys to Tinygrad keys
+    keymap = {
+        "model.embed_tokens.weight": "tok_embeddings.weight",
+        **{f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.self_attn.{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "o"] for l in range(len(model.layers))},
+        **{f"model.layers.{l}.self_attn.{x}_proj.weight_scale": f"layers.{l}.attention.w{x}.scale" for x in ["q", "k", "v", "o"] for l in range(len(model.layers))},
+        **{f"model.layers.{l}.post_attention_layernorm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.mlp.gate_proj.weight": f"layers.{l}.feed_forward.w1.weight" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.mlp.gate_proj.weight_scale": f"layers.{l}.feed_forward.w1.scale" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.mlp.up_proj.weight": f"layers.{l}.feed_forward.w3.weight" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.mlp.up_proj.weight_scale": f"layers.{l}.feed_forward.w3.scale" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.mlp.down_proj.weight": f"layers.{l}.feed_forward.w2.weight" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.mlp.down_proj.weight_scale": f"layers.{l}.feed_forward.w2.scale" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.mlp.ffn_sub_norm.weight": f"layers.{l}.feed_forward.ffn_sub_norm.weight" for l in range(len(model.layers))},
+        **{f"model.layers.{l}.self_attn.attn_sub_norm.weight": f"layers.{l}.attention.attn_sub_norm.weight" for l in range(len(model.layers))},
+        "model.norm.weight": "norm.weight",
+    }
 
-  sd = {}
+    sd: dict[str, Tensor] = {}
+    processed: set[str] = set()
 
-  for k, v in weights.items():
-    if ".rotary_emb." in k: continue
+    for k, v in weights.items():
+        if ".rotary_emb." in k:
+            continue
+        if k not in keymap:
+            if DEBUG >= 1:
+                print(f"Warning: Unmapped key {k} -> shapes {v.shape}")
+            continue
+        target = keymap[k]
+        v = v.to(Device.DEFAULT)
+        final_v: Optional[Tensor] = None
+        scale_key = k.replace(".weight", ".weight_scale")
+        has_scale = scale_key in weights
 
-    v = v.to(Device.DEFAULT)
+        # 1. Check for U8 weights with  a scale
+        if k.endswith(".weight") and has_scale and v.dtype == dtypes.uint8:
+            print(f"  Original U8 shape for {k}: {v.shape}")
+            print(f"  Scale shape for {scale_key}: {weights[scale_key].shape}")
+            v_float = v.cast(dtypes.float32)
+            scale_float = weights[scale_key].cast(dtypes.float32)
 
-    # Apply permutation if necessary (using original logic)
-    if "model.layers" in k:
-      if ("q_proj" in k or "q_norm" in k) and permute_layers and k.endswith("q_proj.weight"): v = permute(v, n_gheads)
-      elif ("k_proj" in k or "k_norm" in k) and permute_layers and k.endswith("k_proj.weight"): v = permute(v, n_kv_heads)
+            # Repeat tensors if needed to match expected dimension 'dim'
+            if v.shape[0] != model.dim and v.shape[0] != 0 and model.dim % v.shape[0] == 0:
+                repeat_factor = model.dim // v.shape[0]
+                print(f"  Repeating U8/Scale by factor {repeat_factor} for {k}")
+                v_repeated = v_float.repeat((repeat_factor, 1))
+                scale_repeated = scale_float.repeat((repeat_factor, 1))
+                # Perform dequantization with repeated tensors
+                final_v = (v_repeated * scale_repeated).cast(dtypes.bfloat16)
+            elif v.shape[0] == model.dim:
+                # Perform dequantization directly if shapes already match
+                final_v = (v_float * scale_float).cast(dtypes.bfloat16)
+                print(f"  Skipping repeat for {k}, U8 shape {v.shape} matches dim {model.dim}")
+            else:
+                # Handle cases where repetition isn't straightforward (e.g., dim not divisible)
+                print(f"  WARNING: Shape mismatch for {k}. U8 shape {v.shape}, dim {model.dim}. Cannot repeat cleanly. Using original scale logic.")
+                # Fallback: Use original scale logic, though shape might still be wrong later
+                final_v = (v_float * scale_float).cast(dtypes.bfloat16) # This will likely keep the wrong shape
 
-    sd[keymap[k]] = v
+            print(f"  Dequantized BF16 shape for {k}: {final_v.shape}")
+        else:
+            final_v = v.cast(dtypes.bfloat16) # Use original if not U8 or no scale
 
-  return sd
+        # maybe permute? - Ensure permute is active (remove comments if previously added)
+        if any(s in k for s in ["wq.weight", "wk.weight"]) and len(final_v.shape) == 2 and final_v.shape[0] == final_v.shape[1]: # Check if square before permute
+            print(f"  Permuting {k} with shape {final_v.shape}") # Print before permute
+            final_v = permute(final_v, n_gheads)
+            print(f"  Shape *after* permute for {k}: {final_v.shape}") # Print *after* permute
+        elif any(s in k for s in ["wq.weight", "wk.weight"]):
+            # Check only length > 1 to avoid error on 1D tensors like biases if they existed
+            if len(final_v.shape) > 1:
+                print(f"  Skipping permute for {k} because shape {final_v.shape} is not square")
+            else:
+                print(f"  Skipping permute for {k} because it's not a 2D tensor (shape {final_v.shape})")
+
+        print(f"  Final shape for {k}: {final_v.shape}") # General print for final shape
+        sd[target] = final_v
+
+    # tie output weight to embeddings if missing
+    if "output.weight" not in sd and "tok_embeddings.weight" in sd:
+        if DEBUG >= 1:
+            print("Tying output.weight to tok_embeddings.weight")
+        sd["output.weight"] = sd["tok_embeddings.weight"]
+
+    # warn missing keys
+    missing = set(keymap.values()) - set(sd.keys())
+    if missing and DEBUG >= 1:
+        print(f"Missing model params: {missing}")
+
+    return sd
+
 
 def convert_from_gguf(weights:dict[str, Tensor], model: Transformer):
     #   keymap = {
@@ -254,8 +325,8 @@ def convert_from_gguf(weights:dict[str, Tensor], model: Transformer):
     return None
 
 def fix_bf16(weights:dict[Any, Tensor]):
-  if getenv("SUPPORT_BF16", 1):
-    # TODO: without casting to float16, 70B llama OOM on tinybox.
-    return {k:v.cast(dtypes.float32).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
-  # TODO: check if device supports bf16
-  return {k:v.llvm_bf16_cast(dtypes.half).to(v.device) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
+    if getenv("SUPPORT_BF16", 1):
+        # TODO: without casting to float16, 70B llama OOM on tinybox.
+        return {k:v.cast(dtypes.float32).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
+    # TODO: check if device supports bf16
+    return {k:v.llvm_bf16_cast(dtypes.half).to(v.device) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}

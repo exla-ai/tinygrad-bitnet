@@ -8,14 +8,15 @@ from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parame
 from tinygrad import Tensor, dtypes, nn, Context, Device, GlobalCounters
 from tinygrad.helpers import Profiling, Timing, DEBUG, colored, fetch, tqdm
 
+import sys
+
 from tokenizers import Tokenizer as HFTokenizer
 
 class Tokenizer:
   pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
   def __init__(self, model_path: str):
-    # mergeable_ranks = load_tiktoken_bpe(model_path)
-    # self.num_base_tokens = len(mergeable_ranks)
-    self.hf_tokenizer = HFTokenizer.from_file(model_path)
+    mergeable_ranks = load_tiktoken_bpe(model_path)
+    self.num_base_tokens = len(mergeable_ranks)
     special_tokens = [
       "<|begin_of_text|>",
       "<|end_of_text|>",
@@ -31,23 +32,19 @@ class Tokenizer:
       f"<|reserved_special_token_{i}|>"
       for i in range(5, 256 - 5)
     ]
-    # self.special_tokens = {token: len(mergeable_ranks) + i for i, token in enumerate(special_tokens)}
+    self.special_tokens = {token: len(mergeable_ranks) + i for i, token in enumerate(special_tokens)}
 
-    # self.model = tiktoken.Encoding(name=model_path, pat_str=self.pat_str, mergeable_ranks=mergeable_ranks, special_tokens=self.special_tokens)
+    self.model = tiktoken.Encoding(name=model_path, pat_str=self.pat_str, mergeable_ranks=mergeable_ranks, special_tokens=self.special_tokens)
 
   @property
   def bos_id(self): return self.special_tokens["<|begin_of_text|>"]
+
   @property
   def stop_tokens(self): return {self.special_tokens["<|end_of_text|>"], self.special_tokens["<|eot_id|>"]}
 
-  def decode(self, toks): 
-    # return self.model.decode([t for t in toks if t < self.num_base_tokens])
-    return self.hf_tokenizer.decode(toks, skip_special_tokens=True)
-
+  def decode(self, toks): return self.model.decode([t for t in toks if t < self.num_base_tokens])
   def encode(self, text, allow_special=False):
-    # return self.model.encode(text, allowed_special="all" if allow_special else set(), disallowed_special=set())
-    return self.hf_tokenizer.encode(text, add_special_tokens=False).ids
-
+    return self.model.encode(text, allowed_special="all" if allow_special else set(), disallowed_special=set())
 
 # **** helper functions ****
 def concat_weights(models, device=None):
@@ -251,7 +248,7 @@ if __name__ == "__main__":
 
   # download_model is the default without a model passed in
   if args.download_model or not args.model:
-    fetch("https://huggingface.co/microsoft/bitnet-b1.58-2B-4T/resolve/main/tokenizer.json", "tokenizer.json", subdir="bitnet")
+    fetch("https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model", "tokenizer.model", subdir="bitnet") # bitnet uses the same tokenizer as llama3
     args.model = fetch("https://huggingface.co/microsoft/bitnet-b1.58-2B-4T/resolve/main/model.safetensors", "model.safetensors", subdir="bitnet")
 
   assert args.model is not None, "please provide --model option"
@@ -261,7 +258,9 @@ if __name__ == "__main__":
   print(f"seed = {Tensor._seed}")
   TEMPERATURE = args.temperature
 
-  tokenizer = Tokenizer(str((args.model if args.model.is_dir() else args.model.parent) / "tokenizer.json"))
+  tokenizer = Tokenizer(str((args.model if args.model.is_dir() else args.model.parent) / "tokenizer.model"))
+
+
   def encode_role(role: str):
     return [tokenizer.special_tokens["<|start_header_id|>"]] + tokenizer.encode(role) + [tokenizer.special_tokens["<|end_header_id|>"]] + tokenizer.encode("\n\n")
   def encode_message(role: str, content: str):
@@ -269,7 +268,10 @@ if __name__ == "__main__":
 
   device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
   model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, device=device)
+
   param_bytes = sum(x.lazydata.size * x.dtype.itemsize for x in get_parameters(model))
+  print(f"ram used: {param_bytes/1e9:.2f} GB")
+
 
   if not args.no_api and not args.benchmark:
     from bottle import Bottle, request, response, HTTPResponse, abort, static_file
@@ -430,20 +432,6 @@ if __name__ == "__main__":
       last_tok = tok
       generated += tokenizer.decode([tok])
       print(generated)
-    if "LLaMA-3/8B-SF-DPO" in args.model.as_posix() and (TEMPERATURE == 0.85 or TEMPERATURE == 0):
-      if TEMPERATURE == 0.85:
-        EXPECTED_TEXT = {
-          1: "Hello! How can I help you today? If you have any questions or need assistance with anything,",
-          2: "Hello! How can I help you today? If you have any questions, need assistance or just want",
-          3: "Hello! How can I help you today? If you have any questions or need assistance, feel free",
-          4: "Hello! How can I assist you today? If you have any questions, need information, or require",
-          5: "Hello! How can I assist you today? If you have any questions or need help with something",
-          6: "Hello! How can I assist you today? If you have any questions, need information, or require",
-        }
-      else:
-        EXPECTED_TEXT = {k: "Hello! How can I assist you today? If you have any questions or need help with something," for k in range(1, 7)}
-      assert generated == EXPECTED_TEXT[args.shard], f"{generated=} {EXPECTED_TEXT[args.shard]}"
-      print("\n" + colored("output validated", "green"))  # NOTE: "\n" inside colored does not render the color in github action
   else:
     prompt = [tokenizer.bos_id] + encode_message("system", "You are an helpful assistant.")
 
