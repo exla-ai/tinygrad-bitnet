@@ -6,7 +6,7 @@ from tiktoken.load import load_tiktoken_bpe
 from extra.models.bitnet import Transformer, convert_from_huggingface, convert_from_gguf, fix_bf16
 from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parameters, gguf_load
 from tinygrad import Tensor, dtypes, nn, Context, Device, GlobalCounters
-from tinygrad.helpers import Profiling, Timing, DEBUG, colored, fetch, tqdm
+from tinygrad.helpers import Profiling, Timing, DEBUG, colored, fetch, tqdm, getenv, CI, JIT
 
 import sys
 
@@ -171,7 +171,7 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
   else:
     weights = load(str(model_path))
   if "model.embed_tokens.weight" in weights:
-    weights = convert_from_huggingface(weights, model, MODEL_PARAMS[model_size]["args"]["n_heads"], MODEL_PARAMS[model_size]["args"]["n_kv_heads"])
+    weights = convert_from_huggingface(weights, model, MODEL_PARAMS[model_size]["args"]["n_heads"], MODEL_PARAMS[model_size]["args"]["n_kv_heads"], device=device)
   elif "token_embd.weight" in weights:
     weights = convert_from_gguf(weights, model)
   weights = fix_bf16(weights)
@@ -229,21 +229,24 @@ def prefill(model, toks, start_pos=0):
 if __name__ == "__main__":
   Tensor.no_grad = True
 
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--download_model", action="store_true", help="Download a model")
-  parser.add_argument("--model", type=Path, help="Model path")
-  parser.add_argument("--size", choices=["2B"], default="2B", help="Model size")
-  parser.add_argument("--shard", type=int, default=1, help="Shard the model across multiple devices")
-  parser.add_argument("--quantize", choices=["int8", "nf4", "float16"], help="Quantization method")
-  parser.add_argument("--no_api", action="store_true", help="Disable the api and run a cli test interface")
+  parser = argparse.ArgumentParser(description="Run BitNet", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+  parser.add_argument("--download_model", action="store_true", help="Download the model specified by --model if it doesn't exist")
+  parser.add_argument("--model", type=Path, help="Path to the model directory or file")
+  parser.add_argument("--size", type=str, default="2B", choices=['2B', '3B'], help="Size of model to use")
+  parser.add_argument("--shard", type=int, default=1, help="Number of shards to use")
+  parser.add_argument("--quantize", type=str, choices=['int8', 'nf4', 'float16'], default=None, help="Quantize the weights to the specified type")
+  parser.add_argument("--no_api", action="store_true", help="Do not start the Gradio API")
   parser.add_argument("--host", type=str, default="0.0.0.0", help="Web server bind address")
   parser.add_argument("--port", type=int, default=7776, help="Web server port")
   parser.add_argument("--debug", action="store_true", help="Enable debug mode")
   parser.add_argument("--seed", type=int, help="Random seed")
-  parser.add_argument("--temperature", type=int, default=0.85, help="Temperature")
+  parser.add_argument("--temperature", type=float, default=0.85, help="Temperature")
   parser.add_argument("--benchmark", action="store_true", help="Run a benchmark")
   parser.add_argument("--timing", action="store_true", help="Print timing per token")
   parser.add_argument("--profile", action="store_true", help="Output profile data")
+  parser.add_argument("--prompt", type=str, default=None, help="Prompt for generation")
+  parser.add_argument("--count", type=int, default=1000, help="Max number of tokens to generate")
+  parser.add_argument("--device", type=str, default=Device.DEFAULT, help="Device to use (e.g., METAL, CUDA, CPU)")
   args = parser.parse_args()
 
   # download_model is the default without a model passed in
@@ -258,15 +261,22 @@ if __name__ == "__main__":
   print(f"seed = {Tensor._seed}")
   TEMPERATURE = args.temperature
 
-  tokenizer = Tokenizer(str((args.model if args.model.is_dir() else args.model.parent) / "tokenizer.model"))
-
+  # Use absolute path for tokenizer model
+  model_dir = args.model if args.model.is_dir() else args.model.parent
+  tokenizer_path = (model_dir / "tokenizer.model").resolve()
+  if not tokenizer_path.is_file():
+    raise FileNotFoundError(f"Tokenizer model not found at expected path: {tokenizer_path}")
+  tokenizer = Tokenizer(str(tokenizer_path))
 
   def encode_role(role: str):
-    return [tokenizer.special_tokens["<|start_header_id|>"]] + tokenizer.encode(role) + [tokenizer.special_tokens["<|end_header_id|>"]] + tokenizer.encode("\n\n")
-  def encode_message(role: str, content: str):
-    return encode_role(role) + tokenizer.encode(content.strip()) + [tokenizer.special_tokens["<|eot_id|>"]]
+    # Flatten the list concatenation
+    return [tokenizer.special_tokens["<|start_header_id|>"], ] + tokenizer.encode(role) + [tokenizer.special_tokens["<|end_header_id|>"], ] + tokenizer.encode("\n\n")
 
-  device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
+  def encode_message(role: str, content: str):
+    return encode_role(role) + tokenizer.encode(content.strip()) + [tokenizer.special_tokens["<|eot_id|>"], ]
+
+  base_device = args.device
+  device = tuple(f"{base_device}:{i}" for i in range(args.shard)) if args.shard > 1 else base_device
   model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, device=device)
 
   param_bytes = sum(x.lazydata.size * x.dtype.itemsize for x in get_parameters(model))
@@ -327,14 +337,16 @@ if __name__ == "__main__":
       last_tok = toks[-1]
       while True:
         GlobalCounters.reset()
-        tok = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P).item()
+        token_tensor = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+        token_id = token_tensor.item()
+        print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
         start_pos += 1
-        last_tok = tok
-        if tok in tokenizer.stop_tokens: break
+        last_tok = token_id
+        if last_tok in tokenizer.stop_tokens: break
 
         res = {
           "choices": [{
-            "text": tokenizer.decode([tok]),
+            "text": tokenizer.decode([last_tok]),
           }]
         }
         yield f"data: {json.dumps(res)}\n\n"
@@ -376,11 +388,13 @@ if __name__ == "__main__":
       last_seen_toks.append(last_tok)
       while True:
         GlobalCounters.reset()
-        tok = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P).item()
+        token_tensor = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+        token_id = token_tensor.item()
+        print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
         start_pos += 1
-        last_tok = tok
-        last_seen_toks.append(tok)
-        if tok in tokenizer.stop_tokens: break
+        last_tok = token_id
+        last_seen_toks.append(last_tok)
+        if last_tok in tokenizer.stop_tokens: break
 
         res = {
           "id": random_id,
@@ -391,7 +405,7 @@ if __name__ == "__main__":
             "index": 0,
             "delta": {
               "role": "assistant",
-              "content": tokenizer.decode([tok]),
+              "content": tokenizer.decode([last_tok]),
             },
             "finish_reason": None,
           }]
@@ -426,11 +440,12 @@ if __name__ == "__main__":
           with Timing("enqueue in ", on_exit=(lambda et: (f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on GPU" if DEBUG>=2 else "")+
                       f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                       (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None):
-            tok = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-          tok = tok.item()
+            token_tensor = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+            token_id = token_tensor.item()
+            print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
+          last_tok = token_id
       start_pos += 1
-      last_tok = tok
-      generated += tokenizer.decode([tok])
+      generated += tokenizer.decode([last_tok])
       print(generated)
   else:
     prompt = [tokenizer.bos_id] + encode_message("system", "You are an helpful assistant.")
@@ -451,10 +466,11 @@ if __name__ == "__main__":
                         f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                         (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None, enabled=args.timing):
 
-              tok = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-            tok = tok.item()
+              token_tensor = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+              token_id = token_tensor.item()
+              print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
+            last_tok = token_id
         start_pos += 1
-        last_tok = tok
-        if tok in tokenizer.stop_tokens: break
-        print(tokenizer.decode([tok]), end="", flush=True)
+        if last_tok in tokenizer.stop_tokens: break
+        print(tokenizer.decode([last_tok]), end="", flush=True)
       print(flush=True)
