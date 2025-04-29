@@ -4,6 +4,8 @@ from tinygrad import Tensor, Variable, TinyJit, dtypes, nn, Device
 from tinygrad.helpers import getenv, DEBUG
 import sys
 import math
+import struct
+import numpy as np
 
 # Quantization Functions (Tinygrad implementation)
 def activation_quant(x: Tensor) -> Tensor:
@@ -40,28 +42,43 @@ def weight_quant(w: Tensor) -> Tensor:
 class BitLinear(nn.Linear):
   def __init__(self, in_features, out_features, bias=False, **kwargs):
     super().__init__(in_features, out_features, bias=bias, **kwargs)
-    # Placeholder: self.beta needs to be calculated during weight loading
-    # Example: self.beta = Tensor([calculated_beta], requires_grad=False, device=self.weight.device, dtype=dtypes.float32)
-    # Example: self.weight should be cast to int8 after quantization
-    # self.weight = self.weight.cast(dtypes.int8)
-    self.beta = Tensor([1.0], requires_grad=False, device=self.weight.device, dtype=dtypes.float32) # TODO: Replace with real beta
+    # Initialize beta as a buffer/parameter, maybe with ones or from init?
+    self.beta = Tensor(1.0) # Will be overwritten by load_state_dict
 
-  # NOTE: STE is removed as we are implementing the inference forward pass directly
   def forward(self, x: Tensor) -> Tensor:
-    # 1. Cast integer weights {-1, 0, 1} to activation dtype
-    # Assuming self.weight is stored as int8 {-1, 0, 1}
+    # x: float input tensor
+    # self.weight: int8 tensor {-1, 0, 1}
+    # self.beta: float tensor (scalar weight scale)
+
+    # 1. Activation quantization to int8
+    # Calculate scale for symmetric int8 quantization
+    act_absmax = x.abs().max(axis=-1, keepdim=True)
+    act_scale = (act_absmax / 127.0).clip(1e-10, float('inf')) # Add clip like in C++ scale calculations
+
+    # Quantize x to int8
+    x_q8 = (x / act_scale).round().clip(-127, 127).cast(dtypes.int8) # Clip to valid int8 range
+
+    # 2. Integer Matrix Multiplication
+    # Ensure weight is int8
     assert self.weight.dtype == dtypes.int8, f"BitLinear weight is {self.weight.dtype}, expected int8"
-    w_float = self.weight.cast(x.dtype)
 
-    # 2. Linear transformation using casted weights
-    # This corresponds to vec_dot result in C++ before scaling
-    output = x.linear(w_float, self.bias)
+    # Perform dot product: int8 @ int8 -> int32 (intermediate)
+    # Casting inputs to int32 prevents potential overflow during accumulation in matmul
+    # Tinygrad's linear should handle the accumulation type correctly, but explicit cast is safer.
+    # TODO: Verify if casting here is strictly needed or if linear handles it.
+    dot_int = x_q8.cast(dtypes.int32).linear(self.weight.cast(dtypes.int32))
 
-    # 3. Apply beta scaling
-    # This corresponds to '* (*scale)' in C++
-    # Ensure self.beta is correctly calculated and stored during init
-    # TODO: Verify broadcasting if beta is not scalar
-    output = output * self.beta
+    # Add bias if it exists (bias is typically float)
+    # Bias addition should happen *after* scaling the main dot product
+    # if self.bias is not None: result += self.bias # Incorrect placement
+
+    # 3. Apply scales (Dequantization)
+    # result = dot_int * act_scale * weight_scale (self.beta)
+    output = dot_int.cast(x.dtype) * act_scale * self.beta
+
+    # Add bias if exists (after scaling)
+    if self.bias is not None:
+      output = output + self.bias.cast(x.dtype)
 
     return output
 
@@ -144,20 +161,22 @@ class Attention:
     xq, keys, values = xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
     attn = xq.scaled_dot_product_attention(keys, values, mask).transpose(1, 2)
     attn = attn.reshape(bsz, seqlen, -1)
+
+    # Apply final projection layer wo using attention output
     return self.wo(attn)
 
 class FeedForward:
   def __init__(self, dim: int, hidden_dim: int, linear: type = nn.Linear):
     self.w1 = linear(dim, hidden_dim, bias=False) # gate_proj
     self.w2 = linear(hidden_dim, dim, bias=False) # down_proj
+    self.w3 = linear(dim, hidden_dim, bias=False) # up_proj
 
   def __call__(self, x: Tensor) -> Tensor:
-    # Simpler activation: Apply activation_quant after w1
-    # Assumes w1 and w2 are BitLinear layers which handle their own quantization
-    # The input x to w1 is already normalized
-    hidden = self.w1(x) 
-    activated_hidden = activation_quant(hidden) # Quantize intermediate activation
-    return self.w2(activated_hidden)
+    # Original BitNet 1.58: SwiGLU -> Linear
+    # Apply SwiGLU activation using normalized input x
+    swiglu_out = self.w1(x).silu() * self.w3(x)
+    # Apply the final linear layer w2 using the intermediate result
+    return self.w2(swiglu_out)
 
 class TransformerBlock:
   def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float, max_context: int, linear: type = nn.Linear,
@@ -256,6 +275,31 @@ class Transformer:
     self.forward_jit = TinyJit(self.forward) if jit else None
     self.dim = dim
 
+  # Helper function to unpack 2-bit weights (assuming i2_s format)
+  # Mapping: 00 -> 0, 01 -> 1, 10 -> -1
+  def unpack_i2_weights(self, data_bytes: bytes, n: int) -> np.ndarray:
+    weights = np.zeros(n, dtype=np.int8)
+    if len(data_bytes) * 4 != n:
+      raise ValueError(f"Data size mismatch: expected {n//4} bytes for {n} weights, got {len(data_bytes)}")
+
+    for i in range(n):
+      byte_idx = i // 4
+      bit_offset = (i % 4) * 2
+      byte = data_bytes[byte_idx]
+      two_bit_val = (byte >> bit_offset) & 0x03 # Isolate the 2 bits
+
+      if two_bit_val == 0:   # 00
+        weights[i] = 0
+      elif two_bit_val == 1: # 01
+        weights[i] = 1
+      elif two_bit_val == 2: # 10
+        weights[i] = -1
+      else: # 11 - Undefined or error based on typical BitNet quantization
+        # Defaulting to 0, but could raise an error
+        # print(f"Warning: Unexpected 2-bit value {two_bit_val} encountered during unpacking. Mapping to 0.")
+        weights[i] = 0 # Or raise ValueError("Invalid 2-bit value")
+    return weights
+
   def load_state_dict(self, state_dict):
     # TODO make this faster...
     for k, v in state_dict.items():
@@ -276,8 +320,8 @@ class Transformer:
           "input_layernorm.weight": layer.attention_norm.weight,
           "post_attention_layernorm.weight": layer.ffn_norm.weight,
           "mlp.gate_proj.weight": layer.feed_forward.w1.weight,
-          "mlp.down_proj.weight": layer.feed_forward.w2.weight,
           "mlp.up_proj.weight": layer.feed_forward.w3.weight,
+          "mlp.down_proj.weight": layer.feed_forward.w2.weight,
           "self_attn.q_proj.weight": layer.attention.wq.weight,
           "self_attn.k_proj.weight": layer.attention.wk.weight,
           "self_attn.v_proj.weight": layer.attention.wv.weight,
@@ -286,14 +330,34 @@ class Transformer:
         if layer_key in key_map:
           target_layer = key_map[layer_key].parent # Get the nn.Linear or RMSNorm layer
           if isinstance(target_layer, BitLinear):
-            # Quantize BitLinear weights
-            t = v.float() # Ensure float32 for calculations
-            beta = t.abs().mean()
-            w_quant = (t / beta.clamp(min=1e-5)).round().clamp(-1, 1)
-            target_layer.weight.assign(w_quant.cast(dtypes.int8).realize())
-            # Assign beta, ensuring it's a Tensor with correct shape/device
-            # Need to handle potential device mismatch if model loaded to different device
-            target_layer.beta.assign(beta.reshape(1).cast(target_layer.beta.dtype).to(target_layer.weight.device).realize())
+            # Assume v contains raw bytes for i2_s: [packed weights][scale]
+            # GGUF loader might pass this as uint8 tensor or similar.
+            # We need the raw bytes.
+            raw_bytes = v.numpy().tobytes() # Get raw bytes from tensor
+
+            # Determine number of weights and expected byte layout
+            rows, cols = target_layer.weight.shape
+            n = rows * cols
+            weight_bytes = n // 4 # 2 bits per weight -> 4 weights per byte
+            scale_bytes_count = 4 # float scale
+
+            if len(raw_bytes) != weight_bytes + scale_bytes_count:
+              raise ValueError(f"Tensor {k} size mismatch: expected {weight_bytes + scale_bytes_count} bytes, got {len(raw_bytes)}")
+
+            # Extract scale (beta)
+            scale_bytes = raw_bytes[weight_bytes:]
+            beta = struct.unpack('<f', scale_bytes)[0]
+
+            # Extract and unpack weights
+            packed_weight_bytes = raw_bytes[:weight_bytes]
+            unpacked_weights_np = self.unpack_i2_weights(packed_weight_bytes, n)
+
+            # Convert back to Tinygrad Tensor, reshape, and assign
+            w_quant = Tensor(unpacked_weights_np, dtype=dtypes.int8, device=v.device).reshape(rows, cols)
+
+            target_layer.weight.assign(w_quant.realize())
+            target_layer.beta.assign(Tensor([beta], dtype=dtypes.float32, device=v.device).realize()) # Store beta as scalar tensor
+
           elif isinstance(target_layer, (nn.Linear, nn.LayerNorm)): # Handle standard layers
             target_layer.weight.assign(v.realize())
           else:
