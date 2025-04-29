@@ -38,34 +38,32 @@ def weight_quant(w: Tensor) -> Tensor:
 
 # BitLinear Layer (Tinygrad implementation)
 class BitLinear(nn.Linear):
-  """
-  Custom linear layer with bit quantization using STE.
-  Input is expected to be normalized before this layer.
-  """
+  def __init__(self, in_features, out_features, bias=False, **kwargs):
+    super().__init__(in_features, out_features, bias=bias, **kwargs)
+    # Placeholder: self.beta needs to be calculated during weight loading
+    # Example: self.beta = Tensor([calculated_beta], requires_grad=False, device=self.weight.device, dtype=dtypes.float32)
+    # Example: self.weight should be cast to int8 after quantization
+    # self.weight = self.weight.cast(dtypes.int8)
+    self.beta = Tensor([1.0], requires_grad=False, device=self.weight.device, dtype=dtypes.float32) # TODO: Replace with real beta
+
+  # NOTE: STE is removed as we are implementing the inference forward pass directly
   def forward(self, x: Tensor) -> Tensor:
-    """
-    Forward pass of the BitLinear layer.
-    Applies STE for both activation and weight quantization.
-    Assumes input 'x' is already normalized by a preceding LayerNorm/RMSNorm.
-    """
-    w = self.weight
+    # 1. Cast integer weights {-1, 0, 1} to activation dtype
+    # Assuming self.weight is stored as int8 {-1, 0, 1}
+    assert self.weight.dtype == dtypes.int8, f"BitLinear weight is {self.weight.dtype}, expected int8"
+    w_float = self.weight.cast(x.dtype)
 
-    # Input 'x' is assumed to be already normalized.
-    # The 'activation_quant' function handles its own necessary scaling (absmax).
-    # gamma = (x.pow(2).mean(-1, keepdim=True) + 1e-6).sqrt() # REMOVED: Redundant calculation on normalized input.
+    # 2. Linear transformation using casted weights
+    # This corresponds to vec_dot result in C++ before scaling
+    output = x.linear(w_float, self.bias)
 
-    # Quantize activations (absmax) with STE
-    x_quant = x + (activation_quant(x) - x).detach()
+    # 3. Apply beta scaling
+    # This corresponds to '* (*scale)' in C++
+    # Ensure self.beta is correctly calculated and stored during init
+    # TODO: Verify broadcasting if beta is not scalar
+    output = output * self.beta
 
-    # Quantize weights (absmean) with STE
-    w_quant = w + (weight_quant(w) - w).detach()
-
-    # Perform linear operation using quantized activations and weights
-    # nn.Linear weight is (out_features, in_features), requires transpose
-    out = x_quant @ w_quant.T
-
-    # return out * gamma # REMOVED: Scaling is handled by normalization before this layer and/or activation quant.
-    return out
+    return output
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
@@ -151,12 +149,15 @@ class Attention:
 class FeedForward:
   def __init__(self, dim: int, hidden_dim: int, linear: type = nn.Linear):
     self.w1 = linear(dim, hidden_dim, bias=False) # gate_proj
-    self.w3 = linear(dim, hidden_dim, bias=False) # up_proj
     self.w2 = linear(hidden_dim, dim, bias=False) # down_proj
 
   def __call__(self, x: Tensor) -> Tensor:
-    # SwiGLU Implementation
-    return self.w2(self.w1(x).silu() * self.w3(x))
+    # Simpler activation: Apply activation_quant after w1
+    # Assumes w1 and w2 are BitLinear layers which handle their own quantization
+    # The input x to w1 is already normalized
+    hidden = self.w1(x) 
+    activated_hidden = activation_quant(hidden) # Quantize intermediate activation
+    return self.w2(activated_hidden)
 
 class TransformerBlock:
   def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float, max_context: int, linear: type = nn.Linear,
@@ -254,6 +255,51 @@ class Transformer:
     self.freqs_cis = precompute_freqs_cis(dim // n_heads, self.max_context * 2, rope_theta).contiguous().to(Device.DEFAULT)
     self.forward_jit = TinyJit(self.forward) if jit else None
     self.dim = dim
+
+  def load_state_dict(self, state_dict):
+    # TODO make this faster...
+    for k, v in state_dict.items():
+      if k.startswith('model.'):
+        k = k[len('model.'):] # remove 'model.' prefix
+      if k == 'embed_tokens.weight':
+        self.tok_embeddings.weight.assign(v.realize())
+      elif k == 'norm.weight':
+        self.norm.weight.assign(v.realize())
+      elif k == 'lm_head.weight':
+        self.output.weight.assign(v.realize())
+      else:
+        layer_id = int(k.split('.')[1])
+        layer_key = k.split('.', 2)[-1]
+        layer = self.layers[layer_id]
+        # Map state_dict keys to layer attribute names
+        key_map = {
+          "input_layernorm.weight": layer.attention_norm.weight,
+          "post_attention_layernorm.weight": layer.ffn_norm.weight,
+          "mlp.gate_proj.weight": layer.feed_forward.w1.weight,
+          "mlp.down_proj.weight": layer.feed_forward.w2.weight,
+          "mlp.up_proj.weight": layer.feed_forward.w3.weight,
+          "self_attn.q_proj.weight": layer.attention.wq.weight,
+          "self_attn.k_proj.weight": layer.attention.wk.weight,
+          "self_attn.v_proj.weight": layer.attention.wv.weight,
+          "self_attn.o_proj.weight": layer.attention.wo.weight
+        }
+        if layer_key in key_map:
+          target_layer = key_map[layer_key].parent # Get the nn.Linear or RMSNorm layer
+          if isinstance(target_layer, BitLinear):
+            # Quantize BitLinear weights
+            t = v.float() # Ensure float32 for calculations
+            beta = t.abs().mean()
+            w_quant = (t / beta.clamp(min=1e-5)).round().clamp(-1, 1)
+            target_layer.weight.assign(w_quant.cast(dtypes.int8).realize())
+            # Assign beta, ensuring it's a Tensor with correct shape/device
+            # Need to handle potential device mismatch if model loaded to different device
+            target_layer.beta.assign(beta.reshape(1).cast(target_layer.beta.dtype).to(target_layer.weight.device).realize())
+          elif isinstance(target_layer, (nn.Linear, nn.LayerNorm)): # Handle standard layers
+            target_layer.weight.assign(v.realize())
+          else:
+            print(f"Skipping unmatched layer type for key: {k}, layer: {type(target_layer)}")
+        else:
+          print(f"Skipping unexpected key: {k}")
 
   def forward(self, tokens: Tensor, start_pos: Union[Variable, int], temperature: float, top_k: int, top_p: float, alpha_f: float, alpha_p: float):
     _bsz, seqlen = tokens.shape
