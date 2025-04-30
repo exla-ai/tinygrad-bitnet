@@ -123,32 +123,25 @@ class TransformerBlock:
 def initialize_iq2s_grid():
     """
     Initialize the grid lookup table for I2_S quantization.
-    This populates BitLinear.iq2s_grid_packed with values derived from llama.cpp.
-    In llama.cpp, this is stored in a 1024-element array of uint64_t values.
+    This populates BitLinear.iq2s_grid_packed with values for dequantization.
     
-    For simplicity, we'll just use a partial grid with placeholder values for now.
-    In a full implementation, all 1024 values would be extracted from llama.cpp.
+    Based on the C++ implementation from llama.cpp/ggml-bitnet.cpp:
+    - In C++, this is stored in a grid of values
+    - For the BitNet I2_S format, we use direct mapping rather than grid lookups
     """
     from tinygrad.nn import BitLinear
     import numpy as np
     
     if BitLinear.iq2s_grid_packed is not None:
         return  # Already initialized
-        
-    # Initialize a placeholder grid with a few known values (simplified version)
-    # For a complete implementation, we would need all 1024 values from llama.cpp
-    grid_size = 1024
-    BitLinear.iq2s_grid_packed = np.zeros(grid_size, dtype=np.uint64)
     
-    # Initialize with some placeholder values (these are not the actual values)
-    # These values should be extracted from the llama.cpp codebase
-    BitLinear.iq2s_grid_packed[0] = 0x0000000000000000
-    BitLinear.iq2s_grid_packed[1] = 0x0000000000000001
-    BitLinear.iq2s_grid_packed[2] = 0x0000000000000002
-    BitLinear.iq2s_grid_packed[3] = 0x0000000000000003
+    # For I2_S (2-bit quantization), we're directly mapping:
+    # 00 -> -1.0, 01 -> 0.0, 10 -> 1.0, 11 -> 0.0 (unused)
+    # This is enough for our dequantization to work correctly
+    BitLinear.iq2s_grid_packed = np.array([-1.0, 0.0, 1.0, 0.0], dtype=np.float32)
     
-    print(f"Initialized IQ2_S grid lookup table with {grid_size} entries (using placeholder values)")
-    # In a real implementation, log a warning that these are placeholder values
+    print(f"Initialized I2_S value mapping table: 00 -> -1.0, 01 -> 0.0, 10 -> 1.0, 11 -> 0.0 (unused)")
+    print(f"Using simplified dequantization without grid lookups based on C++ implementation")
 
 
 def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):

@@ -190,12 +190,13 @@ class BitLinear:
         out_features: size of each output sample
         bias: If set to False, the layer will not learn an additive bias. Default: True
   """
-  # Constants for I2_S quantization
-  QK_K = 256  # Block size (K) for quantization
-  I2S_BLOCK_SIZE_BYTES = 82  # Size of one block in bytes
+  # Constants for I2_S quantization from the C++ code
+  QK_I2_S = 128  # Block size (K) for quantization (according to C++ code)
+  I2S_BLOCK_SIZE_BYTES = 32  # Size of one block in bytes (confirmed in C++ code)
   
   # Masks for I2S quantization
-  kmask_iq2xs = [0x03, 0x0c, 0x30, 0xc0]  # Bit masks for 2-bit groups in a byte
+  kmask_iq2xs = [0xc0, 0x30, 0x0c, 0x03]  # Bit masks for 2-bit groups in a byte
+  kshift_iq2xs = [6, 4, 2, 0]  # Bit shifts for each group
   
   # Grid lookup table for I2_S quantization (populated by initialize_iq2s_grid)
   iq2s_grid_packed = None
@@ -221,55 +222,67 @@ class BitLinear:
   @staticmethod
   def unpack_i2_weights(data_bytes, shape):
     """
-    Unpacks 2-bit quantized weights from raw bytes into a tensor of shape [shape](cci:1://file:///Users/viraat/Documents/projects/BitNet/3rdparty/llama.cpp/ggml/src/ggml.c:5997:0-6012:1).
-    The quantization format matches the GGML implementation:
-    - Each value is encoded in 2 bits: 00 -> -1, 01 -> 0, 10 -> 1
-    - Weights are packed in blocks of 128 (QK_I2) into 32 bytes
-    - Each byte contains bits from 4 different weights (one from each group of 32)
-    - The scale factor is stored as a float32 at the end of the buffer
+    Unpacks 2-bit quantized weights from raw bytes into a tensor of shape `shape`.
+    Based on the C++ implementation in the ggml-bitnet.cpp code.
+    
+    The quantization format works as follows:
+    - Values are represented using 2 bits: 00 -> -1, 01 -> 0, 10 -> 1 (11 is unused)
+    - Data is organized in blocks of 128 (QK_I2_S) elements
+    - Each block is 32 bytes, with each byte containing 4 2-bit values
+    - The bits are organized in specific positions: bits 6-7, 4-5, 2-3, 0-1
+    - A scale factor (float32) is stored after the data
     """
     import struct
     import numpy as np
     from tinygrad.helpers import prod
     
-    n = prod(shape)
-    QK_I2 = 128  # Block size in the C++ code
-    packed_size = n // 4  # Each byte holds 4 weights (2 bits each)
+    n = prod(shape)  # Total number of weights
+    
+    # Constants from the C++ code
+    QK_I2_S = BitLinear.QK_I2_S  # 128 elements per block
+    bytes_per_block = BitLinear.I2S_BLOCK_SIZE_BYTES  # 32 bytes per block
+    nb = n // QK_I2_S  # Number of full blocks
+    
+    # Calculate the size of the packed data (excluding the scale)
+    data_size = (n * 2 + 7) // 8  # Each element is 2 bits
     
     # Extract the scale factor (stored as float32 at the end)
-    scale = struct.unpack('f', data_bytes[packed_size:packed_size+4])[0]
+    scale = struct.unpack('f', data_bytes[data_size:data_size+4])[0]
     
-    # Unpack the weights
+    # Prepare the output array
     weights = np.zeros(n, dtype=np.float32)
     
-    # Process each block of 128 elements
-    for block in range(n // QK_I2):
-        # Process each group of 32 elements
+    # Process each block
+    for block_idx in range(nb):
+        # Each block contains 4 groups, each group has 32 elements
         for group_idx in range(4):
-            # Process each position within the group
+            # Process each of the 32 elements in this group
             for pos in range(32):
-                # Get the byte that contains our weight
-                byte_idx = block * 32 + pos
+                # Find the byte index based on the C++ implementation
+                byte_idx = block_idx * bytes_per_block + pos
                 byte = data_bytes[byte_idx]
                 
-                # Extract the 2 bits for this weight based on group index
-                # Group 0: bits 6-7, Group 1: bits 4-5, Group 2: bits 2-3, Group 3: bits 0-1
-                shift = 6 - 2 * group_idx
-                two_bit_val = (byte >> shift) & 0x03
+                # Extract the 2-bit value using the mask and shift for this group
+                mask = BitLinear.kmask_iq2xs[group_idx]
+                shift = BitLinear.kshift_iq2xs[group_idx]
+                two_bit_val = (byte & mask) >> shift
                 
-                # Map to -1, 0, 1
-                val = 0.0
+                # Map the 2-bit value to -1, 0, 1
                 if two_bit_val == 0:
                     val = -1.0
                 elif two_bit_val == 1:
                     val = 0.0
                 elif two_bit_val == 2:
                     val = 1.0
+                else:  # 3 (11) - unused in the format
+                    val = 0.0
                 
-                # Set the weight
-                weights[block * QK_I2 + group_idx * 32 + pos] = val
+                # Calculate the index in the weights array
+                idx = block_idx * QK_I2_S + group_idx * 32 + pos
+                if idx < n:  # Safety check to prevent out-of-bounds
+                    weights[idx] = val
     
-    # Create weight and scale tensors
+    # Create tensors for weights and scale
     weight_tensor = Tensor(weights.reshape(shape))
     scale_tensor = Tensor([scale], dtype=dtypes.float32)
     
