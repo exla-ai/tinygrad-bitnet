@@ -220,9 +220,9 @@ def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
 class Transformer:
   def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_layers: int, norm_eps: float, vocab_size: int, n_kv_heads=None,
                max_context=1024, jit=False, ffn_dim_multiplier=None, linear: type = nn.Linear, rope_theta: float = 10000.0,
-               embedding: type = nn.Embedding): 
+               embedding: type = nn.Embedding):
     self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear=linear,
-                                    ffn_dim_multiplier=ffn_dim_multiplier) for _ in range(n_layers)]
+                                    ffn_dim_multiplier=ffn_dim_multiplier) for _ in range(n_layers)] 
     self.norm = nn.LayerNorm(dim, eps=norm_eps)
     self.tok_embeddings = embedding(vocab_size, dim) 
     self.output = linear(dim, vocab_size, bias=False) 
@@ -230,6 +230,12 @@ class Transformer:
     self.freqs_cis = precompute_freqs_cis(dim // n_heads, self.max_context * 2, rope_theta).contiguous().to(Device.DEFAULT)
     self.forward_jit = TinyJit(self.forward) if jit else None
     self.dim = dim
+    self.n_kv_heads = n_kv_heads
+    self.hidden_dim = hidden_dim
+    self.vocab_size = vocab_size
+    
+  
+    
 
   def forward(self, tokens: Tensor, start_pos: Union[Variable, int], temperature: float, top_k: int, top_p: float, alpha_f: float, alpha_p: float):
     _bsz, seqlen = tokens.shape
@@ -263,100 +269,132 @@ from tinygrad import dtypes, Device, Tensor
 from tinygrad.helpers import DEBUG
 
 def convert_from_gguf(weights: dict[str, Tensor], model: Transformer) -> dict[str, Tensor]:
-    """
-    Convert GGUF tensor data to Tinygrad Transformer state dict.
+  """
+  Convert GGUF tensor data to Tinygrad Transformer state dict.
     
-    Args:
-        weights: source weight dict from GGUF.
-        model: instance of Tinygrad Transformer.
-        
-    Returns:
-        sd: target state dict mapping Tinygrad param names to Tensors.
-    """
-    from tinygrad.nn import BitLinear
-    import numpy as np
-    from tinygrad.helpers import prod
+  Args:
+      weights: source weight dict from GGUF.
+      model: instance of Tinygrad Transformer.
+      
+  Returns:
+      sd: target state dict mapping Tinygrad param names to Tensors.
+  """
+  from tinygrad.nn import BitLinear
+  import numpy as np
+  from tinygrad.helpers import prod
     
-    # Initialize the I2S grid lookup table
-    if BitLinear.iq2s_grid_packed is None:
-        print("Initializing IQ2_S grid lookup table...")
-        initialize_iq2s_grid()
+  # Initialize the I2S grid lookup table
+  if BitLinear.iq2s_grid_packed is None:
+    print("Initializing IQ2_S grid lookup table...")
+    initialize_iq2s_grid()
     
-    # Expected dimensions for different tensor types
-    expected_shapes = {
-        # Layer weights - we need to transpose some of these based on the model architecture
-        "attention.wq.weight": (model.dim, model.dim),              # (2560, 2560)
-        "attention.wk.weight": (model.dim // 4, model.dim),        # (640, 2560) - divided by n_kv_heads (5)
-        "attention.wv.weight": (model.dim // 4, model.dim),        # (640, 2560) - divided by n_kv_heads (5)
-        "attention.wo.weight": (model.dim, model.dim),              # (2560, 2560)
-        "feed_forward.w1.weight": (6912, model.dim),                # (6912, 2560) - was transposed
-        "feed_forward.w2.weight": (model.dim, 6912),                # (2560, 6912) - was transposed
-        "feed_forward.w3.weight": (6912, model.dim),                # (6912, 2560) - was transposed
-        # Embeddings
-        "tok_embeddings.weight": (128256, model.dim)                # (128256, 2560) - was transposed
-    }
-    
-    # Map GGUF keys to Tinygrad keys
-    keymap = {
-        "token_embd.weight": "tok_embeddings.weight",
-        **{f"blk.{l}.attn_norm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
-        **{f"blk.{l}.attn_q.weight": f"layers.{l}.attention.wq.weight" for l in range(len(model.layers))},
-        **{f"blk.{l}.attn_k.weight": f"layers.{l}.attention.wk.weight" for l in range(len(model.layers))},
-        **{f"blk.{l}.attn_v.weight": f"layers.{l}.attention.wv.weight" for l in range(len(model.layers))},
-        **{f"blk.{l}.attn_output.weight": f"layers.{l}.attention.wo.weight" for l in range(len(model.layers))},
-        **{f"blk.{l}.ffn_norm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
-        **{f"blk.{l}.ffn_gate.weight": f"layers.{l}.feed_forward.w1.weight" for l in range(len(model.layers))},
-        **{f"blk.{l}.ffn_down.weight": f"layers.{l}.feed_forward.w2.weight" for l in range(len(model.layers))},
-        **{f"blk.{l}.ffn_up.weight": f"layers.{l}.feed_forward.w3.weight" for l in range(len(model.layers))},
-        "output_norm.weight": "norm.weight",
-    }
-    
-    sd = {}
-    for k, v in weights.items():
-        if k in keymap:
-            target_key = keymap[k]
+  # Expected dimensions directly from GGUF metadata, not calculated dimensions
+  # The GGUF tensors are stored in [output_dim, input_dim] layout
+  # Need to exactly match the dimensions in the GGUF file, then transpose if needed
+  expected_shapes = {
+    # Layer weights - matching actual GGUF dimensions
+    "attention.wq.weight": (model.dim, model.dim),              # GGUF shows as [2560, 2560]
+    "attention.wk.weight": (model.dim, 512),                   # GGUF shows as [2560, 512] 
+    "attention.wv.weight": (model.dim, 512),                   # GGUF shows as [2560, 512]
+    "attention.wo.weight": (model.dim, model.dim),              # GGUF shows as [2560, 2560]
+    "feed_forward.w1.weight": (model.dim, model.hidden_dim),    # GGUF shows as [2560, 6912]
+    "feed_forward.w2.weight": (model.hidden_dim, model.dim),    # GGUF shows as [6912, 2560]
+    "feed_forward.w3.weight": (model.dim, model.hidden_dim),    # GGUF shows as [2560, 6912]
+    # Embeddings
+    "tok_embeddings.weight": (model.dim, model.vocab_size)      # GGUF shows as [2560, 128256]
+  }
+  
+  # Which tensors need transposing after loading
+  needs_transpose = {
+    "attention.wk.weight": True,
+    "attention.wv.weight": True,
+    "feed_forward.w1.weight": True, 
+    "feed_forward.w3.weight": True,
+    "tok_embeddings.weight": True
+  }
+  
+  # Map GGUF keys to Tinygrad keys
+  keymap = {
+    "token_embd.weight": "tok_embeddings.weight",
+    **{f"blk.{l}.attn_norm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
+    **{f"blk.{l}.attn_q.weight": f"layers.{l}.attention.wq.weight" for l in range(len(model.layers))},
+    **{f"blk.{l}.attn_k.weight": f"layers.{l}.attention.wk.weight" for l in range(len(model.layers))},
+    **{f"blk.{l}.attn_v.weight": f"layers.{l}.attention.wv.weight" for l in range(len(model.layers))},
+    **{f"blk.{l}.attn_output.weight": f"layers.{l}.attention.wo.weight" for l in range(len(model.layers))},
+    **{f"blk.{l}.ffn_norm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
+    **{f"blk.{l}.ffn_gate.weight": f"layers.{l}.feed_forward.w1.weight" for l in range(len(model.layers))},
+    **{f"blk.{l}.ffn_down.weight": f"layers.{l}.feed_forward.w2.weight" for l in range(len(model.layers))},
+    **{f"blk.{l}.ffn_up.weight": f"layers.{l}.feed_forward.w3.weight" for l in range(len(model.layers))},
+    "output_norm.weight": "norm.weight",
+  }
+  
+  sd = {}
+  for k, v in weights.items():
+    if k in keymap:
+      target_key = keymap[k]
             
-            # Handle I2_S quantized weights (returned as tuple from ggml_data_to_tensor)
-            if isinstance(v, tuple) and len(v) == 2:
-                # This is a raw bytes and shape tuple from I2_S format
-                raw_bytes, shape = v
+      # Handle I2_S quantized weights (returned as tuple from ggml_data_to_tensor)
+      if isinstance(v, tuple) and len(v) == 2:
+        # This is a raw bytes and shape tuple from I2_S format
+        raw_bytes, shape = v
                 
-                # Find the target shape for this tensor
-                expected_shape = None
-                name_parts = target_key.split('.')
-                if len(name_parts) >= 3:
-                    base_name = '.'.join(name_parts[1:]) if name_parts[0] == 'layers' else name_parts[-3:]
-                    for shape_name, shape_val in expected_shapes.items():
-                        if shape_name in base_name:
-                            expected_shape = shape_val
-                            break
+        # Find the target shape for this tensor
+        expected_shape = None
+        name_parts = target_key.split('.')
+        if len(name_parts) >= 3:
+          base_name = '.'.join(name_parts[2:]) if name_parts[0] == 'layers' else '.'.join(name_parts)
+          for shape_name, shape_val in expected_shapes.items():
+            if shape_name in base_name:
+              expected_shape = shape_val
+              break
                 
-                if expected_shape is None:
-                    # If we don't have a specific shape mapping, use raw shape
-                    expected_shape = shape
+        if expected_shape is None:
+          raise ValueError(f"Unknown shape for {target_key}")
                 
-                print(f"Unpacking I2_S weights for {target_key} with shape {expected_shape}")
+        print(f"Unpacking I2_S weights for {target_key} with shape {expected_shape}")
                 
-                # Use the unpack_i2_weights method to properly unpack the binary weights
-                weight_tensor, scale_tensor = BitLinear.unpack_i2_weights(raw_bytes, expected_shape)
-                
-                # Store the weight tensor in the state dict
-                sd[target_key] = weight_tensor
-                
-                # Also store the scale tensor with a corresponding name
-                scale_key = target_key.replace('.weight', '.scale')
-                sd[scale_key] = scale_tensor
-            else:
-                # Regular weight (not I2_S quantized, like norm layers)
-                sd[target_key] = v
+        # Use the unpack_i2_weights method to properly unpack the binary weights
+        weight_tensor, scale_tensor = BitLinear.unpack_i2_weights(raw_bytes, expected_shape)
+        
+        # Transpose weight tensor if needed for correct matrix multiplication  
+        base_name = None
+        for shape_name in expected_shapes.keys():
+          if shape_name in target_key:
+            base_name = shape_name
+            break
+            
+        # Apply transpose if this tensor type needs it
+        if base_name and base_name in needs_transpose:
+          print(f"Transposing {target_key} from shape {weight_tensor.shape}")
+          weight_tensor = weight_tensor.transpose()
+          print(f"  to shape {weight_tensor.shape}")
+          
+        # Store the weight tensor
+        sd[target_key] = weight_tensor
+
+        # If scale_tensor is a scalar but we need per-output-feature scales
+        if scale_tensor.shape == (1,) and target_key.endswith('.weight'):
+          # After potential transpose, the output features are the first dimension
+          if base_name and base_name in needs_transpose:
+            out_features = weight_tensor.shape[0]  # After transpose
+          else:
+            out_features = expected_shape[0]  # Original shape
+          
+          expanded_scale = scale_tensor.expand(out_features)
+          sd[target_key.replace('.weight', '.scale')] = expanded_scale
+        else:
+          sd[target_key.replace('.weight', '.scale')] = scale_tensor
+      else:
+        # Regular tensor, just store it
+        sd[target_key] = v
     
-    # Handle output layer (use token embeddings for weight tying)
-    if "token_embd.weight" in weights:
-        sd["output.weight"] = sd["tok_embeddings.weight"]
-        if "tok_embeddings.scale" in sd:
-            sd["output.scale"] = sd["tok_embeddings.scale"]
+  # Handle output layer (use token embeddings for weight tying)
+  if "tok_embeddings.weight" in sd:
+    sd["output.weight"] = sd["tok_embeddings.weight"]
+    if "tok_embeddings.scale" in sd:
+      sd["output.scale"] = sd["tok_embeddings.scale"]
     
-    return sd
+  return sd
 
 def fix_bf16(weights:dict[Any, Tensor]):
     if getenv("SUPPORT_BF16", 1):
@@ -364,44 +402,3 @@ def fix_bf16(weights:dict[Any, Tensor]):
         return {k:v.cast(dtypes.float32).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
     # TODO: check if device supports bf16
     return {k:v.llvm_bf16_cast(dtypes.half).to(v.device) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
-
-def create_bitnet(model_path: str, config, linear:type = nn.Linear, embedding: type = nn.Embedding) -> Transformer: 
-    """Creates the BitNet model with the given configuration."""
-    model = Transformer(
-        dim=config.hidden_size,
-        hidden_dim=config.intermediate_size,
-        n_heads=config.num_attention_heads,
-        n_layers=config.num_hidden_layers,
-        norm_eps=config.rms_norm_eps,
-        vocab_size=config.vocab_size,
-        n_kv_heads=config.num_key_value_heads,
-        max_context=config.max_position_embeddings,
-        rope_theta=config.rope_theta if hasattr(config, 'rope_theta') else 10000.0,
-        linear=linear,
-        embedding=embedding 
-    )
-    return model
-
-# Model Loading
-if __name__ == "__main__":
-  from transformers import AutoConfig
-  from tinygrad.nn import LayerNorm
-  from tinygrad.optim import Adam
-  from tinygrad import Tensor
-  from extra.utils import get_model_path
-  from tinygrad.helpers import getenv
-
-  # Load model and weights
-  model_name = getenv("MODEL", "bit-70b")
-  model_path = get_model_path(model_name)
-  config = AutoConfig.from_pretrained(model_name)
-  print(f"Loading model {model_name} from {model_path}...")
-
-  # Create the model instance using BitLinear 
-  linear_layer = nn.BitLinear
-  
-  embedding_layer = nn.Embedding
-  model = create_bitnet(model_path, config, linear=linear_layer, embedding=embedding_layer)
-
-  # Load weights
-  print(f"Loading weights from {model_path}...")

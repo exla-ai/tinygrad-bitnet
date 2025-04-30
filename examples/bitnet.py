@@ -194,6 +194,29 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
         elif 'output.weight' in k: v.shard_(device, axis=0)
         else: v.shard_(device, axis=None)
 
+    # Reshape weights that don't match the model's expected dimensions (for GGUF compatibility)
+    # This handles the mismatch between expected dimensions and actual GGUF dimensions
+    model_dict = nn.state.get_state_dict(model)
+    for k, v in list(weights.items()):
+      if k.endswith('.attention.wk.weight') or k.endswith('.attention.wv.weight'):
+        if v.shape[0] != model_dict[k].shape[0]:
+          print(f"Reshaping {k} from {v.shape} to match model's {model_dict[k].shape}")
+          # Use padding or truncation to make the weights match
+          if v.shape[0] < model_dict[k].shape[0]:
+            # Pad with zeros if GGUF dimension is smaller
+            padding = model_dict[k].shape[0] - v.shape[0]
+            pad_tensor = Tensor.zeros(padding, v.shape[1], dtype=v.dtype)
+            weights[k] = Tensor.cat(v, pad_tensor)
+          else:
+            # Truncate if GGUF dimension is larger
+            weights[k] = v[:model_dict[k].shape[0]]
+      
+      # Handle feed-forward weights that need transposing
+      if '.feed_forward.w2.weight' in k:
+        if v.shape != model_dict[k].shape:
+          print(f"Transposing {k} from {v.shape} to match model's {model_dict[k].shape}")
+          weights[k] = v.transpose()
+    
     # replace weights in model
     load_state_dict(model, weights, strict=False, consume=True)
   return model
