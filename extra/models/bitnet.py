@@ -120,6 +120,37 @@ class TransformerBlock:
     return out
 
 # standard openai sampling
+def initialize_iq2s_grid():
+    """
+    Initialize the grid lookup table for I2_S quantization.
+    This populates BitLinear.iq2s_grid_packed with values derived from llama.cpp.
+    In llama.cpp, this is stored in a 1024-element array of uint64_t values.
+    
+    For simplicity, we'll just use a partial grid with placeholder values for now.
+    In a full implementation, all 1024 values would be extracted from llama.cpp.
+    """
+    from tinygrad.nn import BitLinear
+    import numpy as np
+    
+    if BitLinear.iq2s_grid_packed is not None:
+        return  # Already initialized
+        
+    # Initialize a placeholder grid with a few known values (simplified version)
+    # For a complete implementation, we would need all 1024 values from llama.cpp
+    grid_size = 1024
+    BitLinear.iq2s_grid_packed = np.zeros(grid_size, dtype=np.uint64)
+    
+    # Initialize with some placeholder values (these are not the actual values)
+    # These values should be extracted from the llama.cpp codebase
+    BitLinear.iq2s_grid_packed[0] = 0x0000000000000000
+    BitLinear.iq2s_grid_packed[1] = 0x0000000000000001
+    BitLinear.iq2s_grid_packed[2] = 0x0000000000000002
+    BitLinear.iq2s_grid_packed[3] = 0x0000000000000003
+    
+    print(f"Initialized IQ2_S grid lookup table with {grid_size} entries (using placeholder values)")
+    # In a real implementation, log a warning that these are placeholder values
+
+
 def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
   assert logits.ndim == 1, "only works on 1d tensors"
   assert 0 <= p <= 1, "p must be between 0 and 1"
@@ -242,6 +273,29 @@ def convert_from_gguf(weights: dict[str, Tensor], model: Transformer) -> dict[st
     Returns:
         sd: target state dict mapping Tinygrad param names to Tensors.
     """
+    from tinygrad.nn import BitLinear
+    import numpy as np
+    from tinygrad.helpers import prod
+    
+    # Initialize the I2S grid lookup table
+    if BitLinear.iq2s_grid_packed is None:
+        print("Initializing IQ2_S grid lookup table...")
+        initialize_iq2s_grid()
+    
+    # Expected dimensions for different tensor types
+    expected_shapes = {
+        # Layer weights - we need to transpose some of these based on the model architecture
+        "attention.wq.weight": (model.dim, model.dim),              # (2560, 2560)
+        "attention.wk.weight": (model.dim // 4, model.dim),        # (640, 2560) - divided by n_kv_heads (5)
+        "attention.wv.weight": (model.dim // 4, model.dim),        # (640, 2560) - divided by n_kv_heads (5)
+        "attention.wo.weight": (model.dim, model.dim),              # (2560, 2560)
+        "feed_forward.w1.weight": (6912, model.dim),                # (6912, 2560) - was transposed
+        "feed_forward.w2.weight": (model.dim, 6912),                # (2560, 6912) - was transposed
+        "feed_forward.w3.weight": (6912, model.dim),                # (6912, 2560) - was transposed
+        # Embeddings
+        "tok_embeddings.weight": (128256, model.dim)                # (128256, 2560) - was transposed
+    }
+    
     # Map GGUF keys to Tinygrad keys
     keymap = {
         "token_embd.weight": "tok_embeddings.weight",
@@ -267,19 +321,31 @@ def convert_from_gguf(weights: dict[str, Tensor], model: Transformer) -> dict[st
                 # This is a raw bytes and shape tuple from I2_S format
                 raw_bytes, shape = v
                 
-                # Find the target layer
-                layer_parts = target_key.split('.')
-                if len(layer_parts) >= 3:
-                    # This is a weight for a BitLinear layer
-                    # Use BitLinear's unpack_i2_weights to convert the raw bytes to a tensor
-                    weight_tensor, scale = nn.BitLinear.unpack_i2_weights(raw_bytes, shape)
-                    
-                    # Store both the weight tensor and scale
-                    sd[target_key] = weight_tensor
-                    sd[target_key.replace('.weight', '.beta')] = scale
-                else:
-                    # This shouldn't happen for I2_S weights, but just in case
-                    print(f"Warning: Unexpected I2_S weight format for {k}")
+                # Find the target shape for this tensor
+                expected_shape = None
+                name_parts = target_key.split('.')
+                if len(name_parts) >= 3:
+                    base_name = '.'.join(name_parts[1:]) if name_parts[0] == 'layers' else name_parts[-3:]
+                    for shape_name, shape_val in expected_shapes.items():
+                        if shape_name in base_name:
+                            expected_shape = shape_val
+                            break
+                
+                if expected_shape is None:
+                    # If we don't have a specific shape mapping, use raw shape
+                    expected_shape = shape
+                
+                print(f"Unpacking I2_S weights for {target_key} with shape {expected_shape}")
+                
+                # Use the unpack_i2_weights method to properly unpack the binary weights
+                weight_tensor, scale_tensor = BitLinear.unpack_i2_weights(raw_bytes, expected_shape)
+                
+                # Store the weight tensor in the state dict
+                sd[target_key] = weight_tensor
+                
+                # Also store the scale tensor with a corresponding name
+                scale_key = target_key.replace('.weight', '.scale')
+                sd[scale_key] = scale_tensor
             else:
                 # Regular weight (not I2_S quantized, like norm layers)
                 sd[target_key] = v
@@ -287,6 +353,8 @@ def convert_from_gguf(weights: dict[str, Tensor], model: Transformer) -> dict[st
     # Handle output layer (use token embeddings for weight tying)
     if "token_embd.weight" in weights:
         sd["output.weight"] = sd["tok_embeddings.weight"]
+        if "tok_embeddings.scale" in sd:
+            sd["output.scale"] = sd["tok_embeddings.scale"]
     
     return sd
 

@@ -190,6 +190,15 @@ class BitLinear:
         out_features: size of each output sample
         bias: If set to False, the layer will not learn an additive bias. Default: True
   """
+  # Constants for I2_S quantization
+  QK_K = 256  # Block size (K) for quantization
+  I2S_BLOCK_SIZE_BYTES = 82  # Size of one block in bytes
+  
+  # Masks for I2S quantization
+  kmask_iq2xs = [0x03, 0x0c, 0x30, 0xc0]  # Bit masks for 2-bit groups in a byte
+  
+  # Grid lookup table for I2_S quantization (populated by initialize_iq2s_grid)
+  iq2s_grid_packed = None
   def __init__(self, in_features: int, out_features:int, bias=True):
     bound = 1 / math.sqrt(in_features)
     self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
@@ -211,7 +220,9 @@ class BitLinear:
     """
     Unpacks 2-bit quantized weights from raw bytes into a tensor of shape `shape`.
     The quantization format matches the GGML implementation:
-    - Each value is encoded in 2 bits: 00 -> -1, 01 -> 0, 10 -> 1, 11 -> 0 (unused)
+    - Weights are packed in a specific pattern with 4 groups of 32 elements
+    - Each byte contains bits from 4 different weights
+    - The bit values map as: 00 -> -1, 01 -> 0, 10 -> 1, 11 -> 0 (unused)
     - The scale factor is stored as a float32 at the end of the buffer
     """
     import struct
@@ -219,7 +230,8 @@ class BitLinear:
     from tinygrad.helpers import prod
     
     n = prod(shape)
-    packed_size = (n + 3) // 4  # Each byte holds 4 weights
+    QK_I2 = 128  # This matches QK_I2 in the C++ code
+    packed_size = n // 4  # Each byte holds portions of 4 weights
     
     # Extract the scale factor (stored as float32 at the end)
     scale = struct.unpack('f', data_bytes[packed_size:packed_size+4])[0]
@@ -227,24 +239,34 @@ class BitLinear:
     # Unpack the weights
     weights = np.zeros(n, dtype=np.float32)
     
-    for i in range(n):
-      byte_idx = i // 4
-      bit_offset = (i % 4) * 2
-      byte = data_bytes[byte_idx]
-      two_bit_val = (byte >> bit_offset) & 0x03
-      
-      # Map according to GGML implementation:
-      # 00 -> -1, 01 -> 0, 10 -> 1, 11 -> 0 (unused)
-      if two_bit_val == 0:
-        weights[i] = -1.0
-      elif two_bit_val == 1:
-        weights[i] = 0.0
-      elif two_bit_val == 2:
-        weights[i] = 1.0
-      else:
-        weights[i] = 0.0  # Unused pattern
+    for i in range(n // QK_I2):
+        for j in range(QK_I2):
+            group_idx = j // 32
+            group_pos = j % 32
+            byte = data_bytes[i * 32 + group_pos]
+            
+            # Extract the 2 bits for this weight based on group index
+            # The shift is (6 - 2 * group_idx) to match the C++ packing
+            shift = 6 - 2 * group_idx
+            two_bit_val = (byte >> shift) & 0x03
+            
+            # Map according to GGML implementation:
+            # 00 -> -1, 01 -> 0, 10 -> 1, 11 -> 0 (unused)
+            val = 0.0
+            if two_bit_val == 0:
+                val = -1.0
+            elif two_bit_val == 1:
+                val = 0.0
+            elif two_bit_val == 2:
+                val = 1.0
+                
+            weights[i * QK_I2 + j] = val
     
-    return Tensor(weights.reshape(shape)), Tensor([scale], dtype=dtypes.float32)
+    weight_tensor = Tensor(weights.reshape(shape))
+    scale_tensor = Tensor([scale], dtype=dtypes.float32)
+    # Apply the scale factor
+    return weight_tensor, scale_tensor
+
 
 class GroupNorm:
   """
