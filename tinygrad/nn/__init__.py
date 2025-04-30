@@ -178,6 +178,74 @@ class Linear:
 
   def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias)
 
+class BitLinear:
+  """
+  Applies a bit-quantized linear transformation to the incoming data.
+  
+  BitLinear uses binary weights (-1, 1) for efficient computation with minimal memory footprint.
+  This is an implementation of the BitNet approach where weights are quantized to 1-bit.
+  
+  Args:
+        in_features: size of each input sample
+        out_features: size of each output sample
+        bias: If set to False, the layer will not learn an additive bias. Default: True
+  """
+  def __init__(self, in_features: int, out_features:int, bias=True):
+    bound = 1 / math.sqrt(in_features)
+    self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
+    self.bias = Tensor.uniform(out_features, low=-bound, high=bound) if bias else None
+
+    # Scale factor (beta) - will be loaded from quantized weights
+    self.beta = Tensor.ones(1, dtype=dtypes.float32)
+
+    self.in_features = in_features
+    self.out_features = out_features
+
+  def __call__(self, x: Tensor) -> Tensor:
+    # Use the pre-quantized weights directly with the scale factor
+    output = x.linear(self.weight.transpose() * self.beta, self.bias)
+    return output
+
+  @staticmethod
+  def unpack_i2_weights(data_bytes, shape):
+    """
+    Unpacks 2-bit quantized weights from raw bytes into a tensor of shape `shape`.
+    The quantization format matches the GGML implementation:
+    - Each value is encoded in 2 bits: 00 -> -1, 01 -> 0, 10 -> 1, 11 -> 0 (unused)
+    - The scale factor is stored as a float32 at the end of the buffer
+    """
+    import struct
+    import numpy as np
+    from tinygrad.helpers import prod
+    
+    n = prod(shape)
+    packed_size = (n + 3) // 4  # Each byte holds 4 weights
+    
+    # Extract the scale factor (stored as float32 at the end)
+    scale = struct.unpack('f', data_bytes[packed_size:packed_size+4])[0]
+    
+    # Unpack the weights
+    weights = np.zeros(n, dtype=np.float32)
+    
+    for i in range(n):
+      byte_idx = i // 4
+      bit_offset = (i % 4) * 2
+      byte = data_bytes[byte_idx]
+      two_bit_val = (byte >> bit_offset) & 0x03
+      
+      # Map according to GGML implementation:
+      # 00 -> -1, 01 -> 0, 10 -> 1, 11 -> 0 (unused)
+      if two_bit_val == 0:
+        weights[i] = -1.0
+      elif two_bit_val == 1:
+        weights[i] = 0.0
+      elif two_bit_val == 2:
+        weights[i] = 1.0
+      else:
+        weights[i] = 0.0  # Unused pattern
+    
+    return Tensor(weights.reshape(shape)), Tensor([scale], dtype=dtypes.float32)
+
 class GroupNorm:
   """
   Applies Group Normalization over a mini-batch of inputs.

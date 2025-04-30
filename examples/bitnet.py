@@ -3,7 +3,7 @@ from typing import List
 import json, argparse, random, time, os
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
-from extra.models.bitnet import Transformer, convert_from_huggingface, convert_from_gguf, fix_bf16
+from extra.models.bitnet import Transformer, convert_from_gguf, fix_bf16
 from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parameters, gguf_load
 from tinygrad import Tensor, dtypes, nn, Context, Device, GlobalCounters
 from tinygrad.helpers import Profiling, Timing, DEBUG, colored, fetch, tqdm, getenv, CI, JIT
@@ -165,15 +165,14 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
   if not load_weights: return model
   # load weights
   if model_path.is_dir():
-    if (model_path / "model.safetensors.index.json").exists(): weights = load(str(model_path / "model.safetensors.index.json"))
-    elif (model_path / "model.safetensors").exists(): weights = load(str(model_path / "model.safetensors"))
+    if (model_path / "ggml-model-i2_s.gguf").exists(): weights = load(str(model_path / "ggml-model-i2_s.gguf"))
     else: weights = concat_weights([load(str(model_path / f"consolidated.{i:02d}.pth")) for i in range(MODEL_PARAMS[model_size]["files"])], device[0] if isinstance(device, tuple) else device)
   else:
     weights = load(str(model_path))
-  if "model.embed_tokens.weight" in weights:
-    weights = convert_from_huggingface(weights, model, MODEL_PARAMS[model_size]["args"]["n_heads"], MODEL_PARAMS[model_size]["args"]["n_kv_heads"], device=device)
-  elif "token_embd.weight" in weights:
+  if "token_embd.weight" in weights:
     weights = convert_from_gguf(weights, model)
+  else:
+    raise ValueError("Currently only support converting from GGUF")
   weights = fix_bf16(weights)
 
   with Context(BEAM=0):
@@ -252,7 +251,7 @@ if __name__ == "__main__":
   # download_model is the default without a model passed in
   if args.download_model or not args.model:
     fetch("https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model", "tokenizer.model", subdir="bitnet") # bitnet uses the same tokenizer as llama3
-    args.model = fetch("https://huggingface.co/microsoft/bitnet-b1.58-2B-4T/resolve/main/model.safetensors", "model.safetensors", subdir="bitnet")
+    args.model = fetch("https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf", "ggml-model-i2_s.gguf", subdir="bitnet")
 
   assert args.model is not None, "please provide --model option"
 

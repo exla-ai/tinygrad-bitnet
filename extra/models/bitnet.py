@@ -7,81 +7,6 @@ import math
 import struct
 import numpy as np
 
-# Quantization Functions (Tinygrad implementation)
-def activation_quant(x: Tensor) -> Tensor:
-  """Per token quantization to 8bits. No grouping is needed for quantization"""
-  scale = (127.0 / x.abs().max(axis=-1, keepdim=True)).clip(1e-5, float('inf')) # Use clip for min_val
-  y = ((x * scale).round().clip(-128, 127)) / scale
-  return y
-
-# Weight Quantization (1.58-bit absmean -> {-1, 0, +1} * scale)
-def weight_quant(w: Tensor) -> Tensor:
-  """
-  Quantize weights to {-1, 0, 1} (1.58 bits) using the RoundClip method
-  from the BitNet b1.58 paper, scaled by the absolute mean (beta).
-  Uses STE for gradient propagation.
-  """
-  # Calculate scale: global absolute mean (beta)
-  # Paper: "scaled by β = E[|W|]"
-  beta = w.abs().mean()
-
-  # Normalize by beta (add clip for numerical stability)
-  w_normalized = w / beta.clip(1e-5, float('inf'))
-
-  # RoundClip: Round to nearest integer, then clip to [-1, 1]
-  w_b = w_normalized.round().clip(-1, 1)
-
-  # Quantized weight for forward pass (used in STE)
-  w_quant = w_b * beta
-
-  # STE (Straight-Through Estimator)
-  # Add the difference between the quantized version and the original, but detach the gradient path
-  return w + (w_quant - w).detach()
-
-# BitLinear Layer (Tinygrad implementation)
-class BitLinear(nn.Linear):
-  def __init__(self, in_features, out_features, bias=False, **kwargs):
-    super().__init__(in_features, out_features, bias=bias, **kwargs)
-    # Initialize beta as a buffer/parameter, maybe with ones or from init?
-    self.beta = Tensor(1.0) # Will be overwritten by load_state_dict
-
-  def forward(self, x: Tensor) -> Tensor:
-    # x: float input tensor
-    # self.weight: int8 tensor {-1, 0, 1}
-    # self.beta: float tensor (scalar weight scale)
-
-    # 1. Activation quantization to int8
-    # Calculate scale for symmetric int8 quantization
-    act_absmax = x.abs().max(axis=-1, keepdim=True)
-    act_scale = (act_absmax / 127.0).clip(1e-10, float('inf')) # Add clip like in C++ scale calculations
-
-    # Quantize x to int8
-    x_q8 = (x / act_scale).round().clip(-127, 127).cast(dtypes.int8) # Clip to valid int8 range
-
-    # 2. Integer Matrix Multiplication
-    # Ensure weight is int8
-    assert self.weight.dtype == dtypes.int8, f"BitLinear weight is {self.weight.dtype}, expected int8"
-
-    # Perform dot product: int8 @ int8 -> int32 (intermediate)
-    # Casting inputs to int32 prevents potential overflow during accumulation in matmul
-    # Tinygrad's linear should handle the accumulation type correctly, but explicit cast is safer.
-    # TODO: Verify if casting here is strictly needed or if linear handles it.
-    dot_int = x_q8.cast(dtypes.int32).linear(self.weight.cast(dtypes.int32))
-
-    # Add bias if it exists (bias is typically float)
-    # Bias addition should happen *after* scaling the main dot product
-    # if self.bias is not None: result += self.bias # Incorrect placement
-
-    # 3. Apply scales (Dequantization)
-    # result = dot_int * act_scale * weight_scale (self.beta)
-    output = dot_int.cast(x.dtype) * act_scale * self.beta
-
-    # Add bias if exists (after scaling)
-    if self.bias is not None:
-      output = output + self.bias.cast(x.dtype)
-
-    return output
-
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
@@ -275,96 +200,6 @@ class Transformer:
     self.forward_jit = TinyJit(self.forward) if jit else None
     self.dim = dim
 
-  # Helper function to unpack 2-bit weights (assuming i2_s format)
-  # Mapping: 00 -> 0, 01 -> 1, 10 -> -1
-  def unpack_i2_weights(self, data_bytes: bytes, n: int) -> np.ndarray:
-    weights = np.zeros(n, dtype=np.int8)
-    if len(data_bytes) * 4 != n:
-      raise ValueError(f"Data size mismatch: expected {n//4} bytes for {n} weights, got {len(data_bytes)}")
-
-    for i in range(n):
-      byte_idx = i // 4
-      bit_offset = (i % 4) * 2
-      byte = data_bytes[byte_idx]
-      two_bit_val = (byte >> bit_offset) & 0x03 # Isolate the 2 bits
-
-      if two_bit_val == 0:   # 00
-        weights[i] = 0
-      elif two_bit_val == 1: # 01
-        weights[i] = 1
-      elif two_bit_val == 2: # 10
-        weights[i] = -1
-      else: # 11 - Undefined or error based on typical BitNet quantization
-        # Defaulting to 0, but could raise an error
-        # print(f"Warning: Unexpected 2-bit value {two_bit_val} encountered during unpacking. Mapping to 0.")
-        weights[i] = 0 # Or raise ValueError("Invalid 2-bit value")
-    return weights
-
-  def load_state_dict(self, state_dict):
-    # TODO make this faster...
-    for k, v in state_dict.items():
-      if k.startswith('model.'):
-        k = k[len('model.'):] # remove 'model.' prefix
-      if k == 'embed_tokens.weight':
-        self.tok_embeddings.weight.assign(v.realize())
-      elif k == 'norm.weight':
-        self.norm.weight.assign(v.realize())
-      elif k == 'lm_head.weight':
-        self.output.weight.assign(v.realize())
-      else:
-        layer_id = int(k.split('.')[1])
-        layer_key = k.split('.', 2)[-1]
-        layer = self.layers[layer_id]
-        # Map state_dict keys to layer attribute names
-        key_map = {
-          "input_layernorm.weight": layer.attention_norm.weight,
-          "post_attention_layernorm.weight": layer.ffn_norm.weight,
-          "mlp.gate_proj.weight": layer.feed_forward.w1.weight,
-          "mlp.up_proj.weight": layer.feed_forward.w3.weight,
-          "mlp.down_proj.weight": layer.feed_forward.w2.weight,
-          "self_attn.q_proj.weight": layer.attention.wq.weight,
-          "self_attn.k_proj.weight": layer.attention.wk.weight,
-          "self_attn.v_proj.weight": layer.attention.wv.weight,
-          "self_attn.o_proj.weight": layer.attention.wo.weight
-        }
-        if layer_key in key_map:
-          target_layer = key_map[layer_key].parent # Get the nn.Linear or RMSNorm layer
-          if isinstance(target_layer, BitLinear):
-            # Assume v contains raw bytes for i2_s: [packed weights][scale]
-            # GGUF loader might pass this as uint8 tensor or similar.
-            # We need the raw bytes.
-            raw_bytes = v.numpy().tobytes() # Get raw bytes from tensor
-
-            # Determine number of weights and expected byte layout
-            rows, cols = target_layer.weight.shape
-            n = rows * cols
-            weight_bytes = n // 4 # 2 bits per weight -> 4 weights per byte
-            scale_bytes_count = 4 # float scale
-
-            if len(raw_bytes) != weight_bytes + scale_bytes_count:
-              raise ValueError(f"Tensor {k} size mismatch: expected {weight_bytes + scale_bytes_count} bytes, got {len(raw_bytes)}")
-
-            # Extract scale (beta)
-            scale_bytes = raw_bytes[weight_bytes:]
-            beta = struct.unpack('<f', scale_bytes)[0]
-
-            # Extract and unpack weights
-            packed_weight_bytes = raw_bytes[:weight_bytes]
-            unpacked_weights_np = self.unpack_i2_weights(packed_weight_bytes, n)
-
-            # Convert back to Tinygrad Tensor, reshape, and assign
-            w_quant = Tensor(unpacked_weights_np, dtype=dtypes.int8, device=v.device).reshape(rows, cols)
-
-            target_layer.weight.assign(w_quant.realize())
-            target_layer.beta.assign(Tensor([beta], dtype=dtypes.float32, device=v.device).realize()) # Store beta as scalar tensor
-
-          elif isinstance(target_layer, (nn.Linear, nn.LayerNorm)): # Handle standard layers
-            target_layer.weight.assign(v.realize())
-          else:
-            print(f"Skipping unmatched layer type for key: {k}, layer: {type(target_layer)}")
-        else:
-          print(f"Skipping unexpected key: {k}")
-
   def forward(self, tokens: Tensor, start_pos: Union[Variable, int], temperature: float, top_k: int, top_p: float, alpha_f: float, alpha_p: float):
     _bsz, seqlen = tokens.shape
     h = self.tok_embeddings(tokens)
@@ -396,204 +231,64 @@ import collections
 from tinygrad import dtypes, Device, Tensor
 from tinygrad.helpers import DEBUG
 
-def convert_from_huggingface(weights: dict[str, Tensor], model, n_heads: int, n_kv_heads: int, permute_layers: bool = True, device=Device.DEFAULT) -> dict[str, Tensor]:
+def convert_from_gguf(weights: dict[str, Tensor], model: Transformer) -> dict[str, Tensor]:
     """
-    Convert HuggingFace BitNet safetensors weights to Tinygrad Transformer state dict.
+    Convert GGUF tensor data to Tinygrad Transformer state dict.
+    
     Args:
-      weights: source weight dict from HuggingFace (safetensors).
-      model: instance of Tinygrad Transformer (for layer count reference).
-      n_heads: number of global heads in the model (n_heads).
-      n_kv_heads: number of key/value heads (n_kv_heads).
-      permute_layers: whether to permute Q/K weight layouts.
+        weights: source weight dict from GGUF.
+        model: instance of Tinygrad Transformer.
+        
     Returns:
-      sd: target state dict mapping Tinygrad param names to Tensors.
+        sd: target state dict mapping Tinygrad param names to Tensors.
     """
-    def permute_qk(v: Tensor, n_heads: int) -> Tensor:
-        # HF stores Q/K in [heads, 2, dim/2, in_dim] order, we need to reshape back
-        shape = v.shape
-        v = v.reshape(n_heads, 2, shape[0] // n_heads // 2, shape[1] if len(shape) > 1 else 1)
-        v = v.transpose(1, 2)
-        return v.reshape(*shape)
-
-    # Map HF keys to Tinygrad keys
+    # Map GGUF keys to Tinygrad keys
     keymap = {
-        "model.embed_tokens.weight": "tok_embeddings.weight",
-        **{f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
-        **{f"model.layers.{l}.self_attn.{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "o"] for l in range(len(model.layers))},
-        **{f"model.layers.{l}.self_attn.{x}_proj.weight_scale": f"layers.{l}.attention.w{x}.scale" for x in ["q", "k", "v", "o"] for l in range(len(model.layers))},
-        **{f"model.layers.{l}.post_attention_layernorm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
-        **{f"model.layers.{l}.mlp.gate_proj.weight": f"layers.{l}.feed_forward.w1.weight" for l in range(len(model.layers))},
-        **{f"model.layers.{l}.mlp.up_proj.weight": f"layers.{l}.feed_forward.w3.weight" for l in range(len(model.layers))},
-        **{f"model.layers.{l}.mlp.down_proj.weight": f"layers.{l}.feed_forward.w2.weight" for l in range(len(model.layers))},
-        "model.norm.weight": "norm.weight",
-        "lm_head.weight": "output.weight"
+        "token_embd.weight": "tok_embeddings.weight",
+        **{f"blk.{l}.attn_norm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
+        **{f"blk.{l}.attn_q.weight": f"layers.{l}.attention.wq.weight" for l in range(len(model.layers))},
+        **{f"blk.{l}.attn_k.weight": f"layers.{l}.attention.wk.weight" for l in range(len(model.layers))},
+        **{f"blk.{l}.attn_v.weight": f"layers.{l}.attention.wv.weight" for l in range(len(model.layers))},
+        **{f"blk.{l}.attn_output.weight": f"layers.{l}.attention.wo.weight" for l in range(len(model.layers))},
+        **{f"blk.{l}.ffn_norm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
+        **{f"blk.{l}.ffn_gate.weight": f"layers.{l}.feed_forward.w1.weight" for l in range(len(model.layers))},
+        **{f"blk.{l}.ffn_down.weight": f"layers.{l}.feed_forward.w2.weight" for l in range(len(model.layers))},
+        **{f"blk.{l}.ffn_up.weight": f"layers.{l}.feed_forward.w3.weight" for l in range(len(model.layers))},
+        "output_norm.weight": "norm.weight",
     }
-
-    sd: dict[str, Tensor] = {}
-    processed: set[str] = set()
-
-    weights_to_skip = {"model.position_embeddings.weight", "model.rotary_emb.freqs", "model.rotary_emb.inv_freq"}
-
+    
+    sd = {}
     for k, v in weights.items():
-        if ".rotary_emb." in k:
-            continue
-        if k not in keymap:
-            if DEBUG >= 1:
-                print(f"Warning: Unmapped key {k} -> shapes {v.shape}")
-            continue
-        target = keymap[k]
-        # Explicitly move AND realize the tensor from DISK to the target device
-        v = v.to(device).realize()
-        final_v: Optional[Tensor] = None
-
-        if k.endswith(".weight"): # Check if it's a weight tensor
-          scale_key = k.replace(".weight", ".weight_scale")
-          has_scale = scale_key in weights
-          target_key = keymap[k] # Get the target key name early
-
-          if has_scale:
-            # Scale key exists, load and realize it
-            scale = weights[scale_key].to(device).realize()
-            scale_float = scale.cast(dtypes.float32)
-
-            if v.dtype == dtypes.uint8:
-              # --- UINT8 Dequantization logic (with repetition) ---
-              print(f"  Original U8 shape for {k}: {v.shape}")
-              print(f"  Scale shape for {scale_key}: {scale.shape}")
-              v_float = v.cast(dtypes.float32)
-              dequantized_v = v_float * scale_float
-
-              # --- Dynamic Repetition Logic --- #
-              # Start with dequantized tensor, default factor is 1 (no repeat)
-              final_v_float = dequantized_v
-              factor = 1
-
-              # Special handling for WQ/WO in microsoft/bitnet-b1.58-2B-4T file
-              if any(s in target_key for s in [".attention.wq.", ".attention.wo."]):
-                if v.shape == (640, 2560): # Check original uint8 shape
-                  factor = 4
-                  print(f"  Applying factor {factor} repeat for {target_key} based on specific shape (640, 2560)")
-                  final_v_float = dequantized_v.repeat((factor, 1)).realize()
-                  print(f"  Repeated shape: {final_v_float.shape}")
-
-              # Only apply GQA repeat to K and V weights if needed (and shape suggests it)
-              elif any(s in target_key for s in [".attention.wk.", ".attention.wv."]):
-                gqa_factor = n_heads // n_kv_heads
-                # Heuristic check: Check if original U8 shape matches expected grouped K/V dim
-                # This check (160, 2560) seemed specific to the file format based on old code.
-                expected_grouped_shape = (n_kv_heads * (model.args.dim // n_heads), model.args.dim) if hasattr(model, 'args') else (160, 2560) # Fallback guess
-
-                if gqa_factor > 1 and v.shape == expected_grouped_shape:
-                  factor = gqa_factor
-                  print(f"  Applying GQA factor {factor} repeat for {target_key} (Original U8 shape: {v.shape})")
-                  final_v_float = dequantized_v.repeat((factor, 1)).realize()
-                  print(f"  Repeated shape: {final_v_float.shape}")
-                elif gqa_factor > 1:
-                   print(f"  GQA factor {gqa_factor} > 1 but shape mismatch for {target_key}. Original U8 shape {v.shape} != Expected shape {expected_grouped_shape}. Skipping repeat.")
-                # else: GQA factor is 1, no repeat needed.
-
-              # Special handling for SwiGLU weights (w1, w3, w2)
-              elif any(s in target_key for s in [".feed_forward.w1.", ".feed_forward.w3."]):
-                 if v.shape == (1728, 2560): # Check original uint8 shape for w1/w3
-                    factor = 4
-                    print(f"  Applying factor {factor} repeat for {target_key} based on specific shape (1728, 2560)")
-                    final_v_float = dequantized_v.repeat((factor, 1)).realize()
-                    print(f"  Repeated shape: {final_v_float.shape}")
-              elif ".feed_forward.w2." in target_key:
-                  if v.shape == (640, 6912): # Check original uint8 shape for w2
-                     factor = 4
-                     print(f"  Applying factor {factor} repeat for {target_key} based on specific shape (640, 6912)")
-                     final_v_float = dequantized_v.repeat((factor, 1)).realize()
-                     print(f"  Repeated shape: {final_v_float.shape}")
-
-              # Cast to target dtype (bfloat16) *after* potential repetition
-              final_v = final_v_float.cast(dtypes.bfloat16).realize()
-              print(f"  Dequantized & Repeated shape for {k}: {final_v.shape}") # Shape after potential repeat and cast
+        if k in keymap:
+            target_key = keymap[k]
+            
+            # Handle I2_S quantized weights (returned as tuple from ggml_data_to_tensor)
+            if isinstance(v, tuple) and len(v) == 2:
+                # This is a raw bytes and shape tuple from I2_S format
+                raw_bytes, shape = v
+                
+                # Find the target layer
+                layer_parts = target_key.split('.')
+                if len(layer_parts) >= 3:
+                    # This is a weight for a BitLinear layer
+                    # Use BitLinear's unpack_i2_weights to convert the raw bytes to a tensor
+                    weight_tensor, scale = nn.BitLinear.unpack_i2_weights(raw_bytes, shape)
+                    
+                    # Store both the weight tensor and scale
+                    sd[target_key] = weight_tensor
+                    sd[target_key.replace('.weight', '.beta')] = scale
+                else:
+                    # This shouldn't happen for I2_S weights, but just in case
+                    print(f"Warning: Unexpected I2_S weight format for {k}")
             else:
-              # Has scale key but is NOT uint8 (e.g., might be old format or error in weights?)
-              # Apply scale but don't assume uint8 properties
-              print(f"  Weight {k} ({target_key}) has scale {scale_key} but is dtype {v.dtype}. Applying scale.")
-              final_v = (v.cast(dtypes.float32) * scale_float).cast(dtypes.bfloat16)
-          else:
-            # No scale key exists for this weight (e.g., norm layers, embed_tokens)
-            # Just cast the weight tensor.
-            print(f"  Weight {k} ({target_key}) has no scale key. Casting only.")
-            final_v = v.cast(dtypes.bfloat16)
-
-          # Apply QK permutation if needed (after handling scale/casting)
-          if final_v is not None and any(s in target_key for s in [".attention.wq.weight", ".attention.wk.weight"]) and len(final_v.shape) == 2 and final_v.shape[0] == final_v.shape[1]:
-            print(f"  Permuting QK {k} ({target_key})")
-            final_v = permute_qk(final_v, n_heads)
-
-        elif k.endswith(".weight_scale"):
-          # Skip scale keys directly, they are handled with their weight.
-          continue
-        elif k in weights_to_skip:
-          continue
-        else:
-          # Handle other parameters (e.g., biases if they existed, though paper says removed)
-          # Currently, assumes only weights need processing/casting
-          target_key = keymap.get(k, k) # Use original key if not in map
-          print(f"  Handling non-weight/non-scale key {k} ({target_key}). Assuming correct type/device.")
-          final_v = v # Already moved to device earlier
-
-        if final_v is not None:
-          # Re-fetch target_key in case it wasn't a weight
-          target = keymap.get(k, None)
-          if target:
-            print(f"  Final shape for {target}: {final_v.shape}")
-            sd[target] = final_v
-          else:
-            # This case handles keys not in the explicit keymap but still loaded
-            # Example: If biases existed, or future unexpected keys.
-            # We keep them if they were loaded, using the original key.
-            if k not in weights_to_skip and not k.endswith(".weight_scale"):
-              print(f"  Assigning unexpected key {k} with shape {final_v.shape} to state dict.")
-              sd[k] = final_v
-        else:
-          # Should not happen often with the new logic, but log if it does
-          print(f"  Skipping assignment for {k} (final_v is None)")
-
-    # Handle output layer (lm_head) - check for tying
-    if 'lm_head.weight' in weights and 'lm_head.weight' not in processed:
-        print("Processing separate lm_head.weight")
-        lm_head_v = weights['lm_head.weight']
-        # Assume lm_head is not quantized/scaled typically, but cast just in case
-        if lm_head_v.dtype != dtypes.bfloat16:
-            print(f"  Casting lm_head.weight from {lm_head_v.dtype} to bfloat16")
-            sd['output.weight'] = lm_head_v.cast(dtypes.bfloat16).realize()
-        else:
-            sd['output.weight'] = lm_head_v
-        processed.add('lm_head.weight')
-    elif 'tok_embeddings.weight' in sd:
-        print("lm_head.weight not found or already processed. Assuming weight tying with tok_embeddings.")
-        sd['output.weight'] = sd['tok_embeddings.weight']
-    else:
-        print("ERROR: Cannot determine output.weight. Neither lm_head.weight nor tok_embeddings.weight found/processed.")
-
-    # Check for unprocessed keys
-    unprocessed = set(weights.keys()) - processed - weights_to_skip
-    if unprocessed:
-        print(f"Warning: Unprocessed keys: {unprocessed}")
-
+                # Regular weight (not I2_S quantized, like norm layers)
+                sd[target_key] = v
+    
+    # Handle output layer (use token embeddings for weight tying)
+    if "token_embd.weight" in weights:
+        sd["output.weight"] = sd["tok_embeddings.weight"]
+    
     return sd
-
-
-def convert_from_gguf(weights:dict[str, Tensor], model: Transformer):
-    #   keymap = {
-    #     "token_embd.weight": "tok_embeddings.weight",
-    #     **{f"blk.{l}.attn_norm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
-    #     **{f"blk.{l}.attn_{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v"] for l in range(len(model.layers))},
-    #     **{f"blk.{l}.attn_output.weight": f"layers.{l}.attention.wo.weight" for l in range(len(model.layers))},
-    #     **{f"blk.{l}.ffn_norm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
-    #     **{f"blk.{l}.ffn_{x}.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(len(model.layers))},
-    #     "output_norm.weight": "norm.weight",
-    #     "rope_freqs.weight": "rope_freqs.weight",
-    #   }
-    #   sd = {keymap[k]: v for k,v in weights.items()}
-    #   sd["output.weight"] = weights["token_embd.weight"]
-    #   return sd
-    return None
 
 def fix_bf16(weights:dict[Any, Tensor]):
     if getenv("SUPPORT_BF16", 1):
@@ -634,9 +329,9 @@ if __name__ == "__main__":
   config = AutoConfig.from_pretrained(model_name)
   print(f"Loading model {model_name} from {model_path}...")
 
-  # Create the model instance, passing BitLinear if quant_method indicates
-  linear_layer = BitLinear if config.quant_method == "bitnet" else nn.Linear
-  # Note: BitNet doesn't specify embedding quantization, use standard nn.Embedding for now
+  # Create the model instance using BitLinear 
+  linear_layer = nn.BitLinear
+  
   embedding_layer = nn.Embedding
   model = create_bitnet(model_path, config, linear=linear_layer, embedding=embedding_layer)
 
