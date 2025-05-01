@@ -244,8 +244,8 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
 TEMPERATURE = 1.2
 TOP_K = 0
 TOP_P = 0.0
-ALPHA_F = 0.0
-ALPHA_P = 0.0
+ALPHA_F = 0.2
+ALPHA_P = 0.2
 
 last_seen_toks = []
 def prefill(model, toks, start_pos=0):
