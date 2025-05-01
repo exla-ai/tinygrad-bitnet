@@ -157,9 +157,7 @@ MODEL_PARAMS = {
 
 def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dtype=dtypes.float16, device=None, max_context=8192, load_weights=True):
   # build model
-  if quantize == "int8": linear, embedding, quantize_embeds = Int8Linear, Int8Embedding, True
-  elif quantize == "nf4": linear, embedding, quantize_embeds = NF4Linear(64), nn.Embedding, False
-  else: linear, embedding, quantize_embeds = nn.Linear, nn.Embedding, False
+  linear, embedding, quantize_embeds = nn.BitLinear, nn.Embedding, False
   model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=linear, embedding=embedding, max_context=max_context, jit=True)
 
   if not load_weights: return model
@@ -173,7 +171,7 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
     weights = convert_from_gguf(weights, model)
   else:
     raise ValueError("Currently only support converting from GGUF")
-  weights = fix_bf16(weights)
+  # weights = fix_bf16(weights)
 
   with Context(BEAM=0):
     # quantize
@@ -210,12 +208,33 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
           else:
             # Truncate if GGUF dimension is larger
             weights[k] = v[:model_dict[k].shape[0]]
+          
+          # Also handle the corresponding scale tensor
+          scale_key = k.replace('.weight', '.scale')
+          if scale_key in weights and scale_key in model_dict:
+            print(f"Reshaping {scale_key} from {weights[scale_key].shape} to match model's {model_dict[scale_key].shape}")
+            if weights[scale_key].shape[0] < model_dict[scale_key].shape[0]:
+              # Pad with ones if GGUF dimension is smaller
+              padding = model_dict[scale_key].shape[0] - weights[scale_key].shape[0]
+              pad_tensor = Tensor.ones(padding, dtype=weights[scale_key].dtype)
+              weights[scale_key] = Tensor.cat(weights[scale_key], pad_tensor)
+            else:
+              # Truncate if GGUF dimension is larger
+              weights[scale_key] = weights[scale_key][:model_dict[scale_key].shape[0]]
       
       # Handle feed-forward weights that need transposing
       if '.feed_forward.w2.weight' in k:
         if v.shape != model_dict[k].shape:
           print(f"Transposing {k} from {v.shape} to match model's {model_dict[k].shape}")
           weights[k] = v.transpose()
+          
+          # Also handle the corresponding scale tensor
+          scale_key = k.replace('.weight', '.scale')
+          if scale_key in weights and scale_key in model_dict:
+            print(f"Reshaping {scale_key} from {weights[scale_key].shape} to match model's {model_dict[scale_key].shape}")
+            # When we transpose the weights, we need to reorient the scales
+            if weights[scale_key].shape[0] != model_dict[scale_key].shape[0]:
+              weights[scale_key] = weights[scale_key][:model_dict[scale_key].shape[0]]
     
     # replace weights in model
     load_state_dict(model, weights, strict=False, consume=True)
@@ -386,38 +405,82 @@ if __name__ == "__main__":
 
     @app.post("/v1/chat/completions")
     def chat_completions():
-      global last_seen_toks
-      rjson = json.loads(request.body.read())
-      if "messages" not in rjson: abort(400, "messages required")
+      try:
+        print("[DEBUG] Starting chat_completions handler")
+        global last_seen_toks
+        rjson = json.loads(request.body.read())
+        print(f"[DEBUG] Request JSON: {rjson}")
+        if "messages" not in rjson: abort(400, "messages required")
 
-      # check if we are streaming
-      if rjson.get("stream", False):
-        response.content_type = "text/event-stream"
-        response.set_header("Cache-Control", "no-cache")
-      else: abort(400, "streaming required")
+        # check if we are streaming
+        if rjson.get("stream", False):
+          response.content_type = "text/event-stream"
+          response.set_header("Cache-Control", "no-cache")
+        else: abort(400, "streaming required")
 
-      toks = [tokenizer.bos_id]
-      for message in rjson["messages"]:
-        toks += encode_message(message["role"], message["content"])
-      # ensure that the last message was a user message
-      if message["role"] != "user": abort(400, "last message must be a user message")
-      toks += encode_role("assistant")
+        print("[DEBUG] Creating token sequence")
+        toks = [tokenizer.bos_id]
+        print(f"[DEBUG] Starting with BOS token: {tokenizer.bos_id}")
+        for message in rjson["messages"]:
+          print(f"[DEBUG] Processing message: {message['role']}")
+          message_tokens = encode_message(message["role"], message["content"])
+          print(f"[DEBUG] Encoded to {len(message_tokens)} tokens")
+          toks += message_tokens
+        # ensure that the last message was a user message
+        if message["role"] != "user": abort(400, "last message must be a user message")
+        print("[DEBUG] Adding assistant role")
+        toks += encode_role("assistant")
 
-      random_id = random.randbytes(16).hex()
+        random_id = random.randbytes(16).hex()
+        print(f"[DEBUG] Token sequence length: {len(toks)}")
 
-      start_pos = prefill(model, toks[:-1])
-      last_tok = toks[-1]
-      last_seen_toks.append(last_tok)
-      while True:
-        GlobalCounters.reset()
-        token_tensor = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-        token_id = token_tensor.item()
-        print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
-        start_pos += 1
-        last_tok = token_id
+        print("[DEBUG] Starting prefill with token sequence")
+        start_pos = prefill(model, toks[:-1])
+        print(f"[DEBUG] Prefill complete, start_pos = {start_pos}")
+        last_tok = toks[-1]
+        print(f"[DEBUG] Initial last_tok = {last_tok}")
         last_seen_toks.append(last_tok)
-        if last_tok in tokenizer.stop_tokens: break
+        print("[DEBUG] Beginning generation loop")
+        while True:
+          try:
+            print(f"[DEBUG] Generating next token from last_tok={last_tok} at position {start_pos}")
+            GlobalCounters.reset()
+            print(f"[DEBUG] Creating input tensor with shape [[{last_tok}]]")
+            input_tensor = Tensor([[last_tok]], device=device)
+            print(f"[DEBUG] Calling model with input tensor")
+            token_tensor = model(input_tensor, start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+            print(f"[DEBUG] Got token tensor with shape {token_tensor.shape}, extracting item")
+            token_id = token_tensor.item()
+            print(f"[DEBUG] Generated token ID: {token_id}")
+            start_pos += 1
+            last_tok = token_id
+            last_seen_toks.append(last_tok)
+            if last_tok in tokenizer.stop_tokens: 
+              print(f"[DEBUG] Found stop token: {last_tok}, breaking generation loop")
+              break
 
+            res = {
+              "id": random_id,
+              "object": "chat.completion.chunk",
+              "created": int(time.time()),
+              "model": str(args.model),
+              "choices": [{
+                "index": 0,
+                "delta": {
+                  "role": "assistant",
+                  "content": tokenizer.decode([last_tok]),
+                },
+                "finish_reason": None,
+              }]
+            }
+            yield f"data: {json.dumps(res)}\n\n"
+          except Exception as e:
+            print(f"[DEBUG] Error in generation loop: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+        # Final response after generation is complete
         res = {
           "id": random_id,
           "object": "chat.completion.chunk",
@@ -425,27 +488,16 @@ if __name__ == "__main__":
           "model": str(args.model),
           "choices": [{
             "index": 0,
-            "delta": {
-              "role": "assistant",
-              "content": tokenizer.decode([last_tok]),
-            },
-            "finish_reason": None,
+            "delta": {},
+            "finish_reason": "stop",
           }]
         }
         yield f"data: {json.dumps(res)}\n\n"
-
-      res = {
-        "id": random_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": str(args.model),
-        "choices": [{
-          "index": 0,
-          "delta": {},
-          "finish_reason": "stop",
-        }]
-      }
-      yield f"data: {json.dumps(res)}\n\n"
+      except Exception as e:
+        print(f"[DEBUG] CRITICAL ERROR in chat_completions: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
     app.run(host=args.host, port=args.port, debug=args.debug)
   elif args.benchmark:

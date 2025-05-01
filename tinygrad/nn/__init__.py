@@ -339,7 +339,7 @@ class BitLinear:
     scaled_weight = self.weight * self.scale.reshape(-1, 1)
     
     # Standard matrix multiplication with the scaled binary weights
-    return x.linear(scaled_weight, self.bias)
+    return x.linear(scaled_weight.T, self.bias)
 
   @staticmethod
   def unpack_i2_weights(data_bytes, shape):

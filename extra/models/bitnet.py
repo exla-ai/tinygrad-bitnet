@@ -38,7 +38,7 @@ def repeat_kv(x:Tensor, n_rep:int) -> Tensor:
   return x.repeat((1, 1, 1, n_rep)).reshape(bs, seqlen, n_kv_heads * n_rep, head_dim)
 
 class Attention:
-  def __init__(self, dim: int, n_heads: int, n_kv_heads: int, max_context: int, linear: type = nn.Linear):
+  def __init__(self, dim: int, n_heads: int, n_kv_heads: int, max_context: int, linear: type = nn.BitLinear):
     self.n_heads = n_heads
     self.n_kv_heads = n_kv_heads if n_kv_heads is not None else n_heads
     self.head_dim = dim // n_heads
@@ -91,7 +91,7 @@ class Attention:
     return self.wo(attn)
 
 class FeedForward:
-  def __init__(self, dim: int, hidden_dim: int, linear: type = nn.Linear):
+  def __init__(self, dim: int, hidden_dim: int, linear: type = nn.BitLinear):
     self.w1 = linear(dim, hidden_dim, bias=False) # gate_proj
     self.w2 = linear(hidden_dim, dim, bias=False) # down_proj
     self.w3 = linear(dim, hidden_dim, bias=False) # up_proj
