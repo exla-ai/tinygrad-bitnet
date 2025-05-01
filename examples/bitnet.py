@@ -241,7 +241,7 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
   return model
 
 # default settings
-TEMPERATURE = 0.95
+TEMPERATURE = 1.2
 TOP_K = 0
 TOP_P = 0.0
 ALPHA_F = 0.0
