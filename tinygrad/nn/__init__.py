@@ -191,6 +191,7 @@ class BitLinear:
         bias: If set to False, the layer will not learn an additive bias. Default: True
   """
   # Constants for I2_S quantization from the C++ code
+  QK_K = 256  # Global block size constant
   QK_I2_S = 128  # Block size (K) for quantization (according to C++ code)
   I2S_BLOCK_SIZE_BYTES = 32  # Size of one block in bytes (confirmed in C++ code)
   
@@ -209,15 +210,136 @@ class BitLinear:
     # Scale factor - will be loaded from quantized weights
     # Use consistent naming - let's stick with "scale"
     self.scale = Tensor.ones(out_features, dtype=dtypes.float32)  # One scale per output feature
-
+    
+    # For I2_S quantized weights storage in raw block format
+    self.raw_blocks = None  # Will be populated when loading weights
+    
     self.in_features = in_features
     self.out_features = out_features
 
+  def _quantize_row_q8_1_tensor(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    """
+    Quantize a row to 8-bit integers and return scales.
+    Args:
+        x: Input tensor of shape [batch_size, in_features]
+    Returns:
+        Tuple of (quantized_tensor, scales)
+    """
+    print(f"[BitLinear._quantize_row_q8_1_tensor] Input shape={x.shape}, dtype={x.dtype}, stats: min={x.min().item():.6f}, max={x.max().item():.6f}, mean={x.mean().item():.6f}")
+    
+    # Get max absolute value for scaling
+    x_abs = x.abs()
+    print(f"[BitLinear._quantize_row_q8_1_tensor] x_abs shape={x_abs.shape}, stats: min={x_abs.min().item():.6f}, max={x_abs.max().item():.6f}, mean={x_abs.mean().item():.6f}")
+    
+    x_max = x_abs.max(axis=1, keepdim=True).clip(min=1e-5)  # Ensure non-zero scale
+    print(f"[BitLinear._quantize_row_q8_1_tensor] x_max shape={x_max.shape}, stats: min={x_max.min().item():.6f}, max={x_max.max().item():.6f}, mean={x_max.mean().item():.6f}")
+    
+    # Compute scale (1/max) and quantize
+    scale = 127.0 / x_max
+    print(f"[BitLinear._quantize_row_q8_1_tensor] scale shape={scale.shape}, stats: min={scale.min().item():.6f}, max={scale.max().item():.6f}, mean={scale.mean().item():.6f}")
+    
+    # Apply scaling and clipping
+    scaled_x = (x * scale)
+    print(f"[BitLinear._quantize_row_q8_1_tensor] scaled_x shape={scaled_x.shape}, stats: min={scaled_x.min().item():.6f}, max={scaled_x.max().item():.6f}, mean={scaled_x.mean().item():.6f}")
+    
+    # Round to nearest integer and clip to int8 range
+    rounded_x = scaled_x.round()
+    print(f"[BitLinear._quantize_row_q8_1_tensor] rounded_x shape={rounded_x.shape}, stats: min={rounded_x.min().item():.6f}, max={rounded_x.max().item():.6f}, mean={rounded_x.mean().item():.6f}")
+    
+    clipped_x = rounded_x.clip(-127, 127)
+    print(f"[BitLinear._quantize_row_q8_1_tensor] clipped_x shape={clipped_x.shape}, stats: min={clipped_x.min().item():.6f}, max={clipped_x.max().item():.6f}, mean={clipped_x.mean().item():.6f}")
+    
+    x_quant = clipped_x.cast(dtypes.int8)
+    print(f"[BitLinear._quantize_row_q8_1_tensor] x_quant shape={x_quant.shape}, dtype={x_quant.dtype}, stats: min={x_quant.min().item()}, max={x_quant.max().item()}, mean={x_quant.mean().item():.3f}")
+    
+    # Return inverse scale for dequantization later
+    inv_scale = 1.0 / scale
+    print(f"[BitLinear._quantize_row_q8_1_tensor] inv_scale shape={inv_scale.shape}, stats: min={inv_scale.min().item():.6f}, max={inv_scale.max().item():.6f}, mean={inv_scale.mean().item():.6f}")
+    
+    return x_quant, inv_scale
+
+  def _parse_iq2s_block_tensor(self, block_idx: int) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Parse an I2_S data block into tensors with scale, values and grid indices.
+    
+    Args:
+        block_idx: Index of the block to parse
+        
+    Returns:
+        Tuple of (scales, values, grid_indices)
+    """
+    print(f"[BitLinear._parse_iq2s_block_tensor] Starting for block_idx={block_idx}")
+    
+    if self.raw_blocks is None:
+      print(f"[BitLinear._parse_iq2s_block_tensor] ERROR: raw_blocks is None")
+      raise ValueError("No raw blocks data available. Model must be loaded from GGUF format.")
+    
+    print(f"[BitLinear._parse_iq2s_block_tensor] raw_blocks shape={self.raw_blocks.shape}, dtype={self.raw_blocks.dtype}")
+    
+    # Check if iq2s_grid_packed is initialized
+    if BitLinear.iq2s_grid_packed is None:
+      print(f"[BitLinear._parse_iq2s_block_tensor] WARNING: iq2s_grid_packed is None, dequantization will be incorrect")
+    else:
+      print(f"[BitLinear._parse_iq2s_block_tensor] iq2s_grid_packed shape={BitLinear.iq2s_grid_packed.shape}, dtype={BitLinear.iq2s_grid_packed.dtype}")
+    
+    # Placeholder - in a real implementation this would parse the raw block data
+    # and return the scales, binary values and grid indices for the block
+    # For now, just use the regular weights
+    block_size = self.QK_I2_S
+    start_idx = block_idx * block_size
+    end_idx = min((block_idx + 1) * block_size, self.weight.shape[1])
+    
+    print(f"[BitLinear._parse_iq2s_block_tensor] Block range: {start_idx} to {end_idx} (size {end_idx-start_idx})")
+    
+    # Mock implementation - extract a slice of the weight tensor for this block
+    block_weights = self.weight[:, start_idx:end_idx]
+    block_scale = self.scale.unsqueeze(1)
+    
+    print(f"[BitLinear._parse_iq2s_block_tensor] block_weights shape={block_weights.shape}, stats: min={block_weights.min().item():.6f}, max={block_weights.max().item():.6f}, mean={block_weights.mean().item():.6f}")
+    print(f"[BitLinear._parse_iq2s_block_tensor] block_scale shape={block_scale.shape}, stats: min={block_scale.min().item():.6f}, max={block_scale.max().item():.6f}, mean={block_scale.mean().item():.6f}")
+    
+    # Check what percentage of weights are non-zero
+    non_zero_percent = (block_weights != 0).sum().item() / block_weights.numel() * 100
+    print(f"[BitLinear._parse_iq2s_block_tensor] Non-zero weights: {non_zero_percent:.2f}%")
+    
+    # Debug the distribution of weight values in this block
+    if block_weights.numel() > 0:
+      unique_vals, counts = np.unique(block_weights.numpy(), return_counts=True)
+      print(f"[BitLinear._parse_iq2s_block_tensor] Unique values: {unique_vals[:10] if len(unique_vals) > 10 else unique_vals}")
+      print(f"[BitLinear._parse_iq2s_block_tensor] Value counts: {counts[:10] if len(counts) > 10 else counts}")
+    
+    # For I2_S, we should have mostly -1, 0, 1 values
+    if block_weights.numel() > 0:
+      neg_one_count = ((block_weights == -1).sum().item() / block_weights.numel() * 100)
+      zero_count = ((block_weights == 0).sum().item() / block_weights.numel() * 100)
+      pos_one_count = ((block_weights == 1).sum().item() / block_weights.numel() * 100)
+      print(f"[BitLinear._parse_iq2s_block_tensor] Value distribution: -1: {neg_one_count:.2f}%, 0: {zero_count:.2f}%, 1: {pos_one_count:.2f}%")
+      other_count = 100 - neg_one_count - zero_count - pos_one_count
+      print(f"[BitLinear._parse_iq2s_block_tensor] Other values: {other_count:.2f}%")
+    
+    return block_scale, block_weights, None
+    
   def __call__(self, x: Tensor) -> Tensor:
-    # Proper scaling of binary weights
-    # The scale should be broadcasted to each row of weights
-    scaled_weight = self.weight * self.scale.reshape(-1, 1)  # Scale each output row
-    return x.linear(scaled_weight.transpose(), self.bias)
+    """
+    Execute the BitLinear transformation with I2_S quantized weights.
+    
+    For BitNet's 1.58-bit weights, this is actually simple:
+    1. The weight values are already unpacked to -1, 0, 1 when loaded
+    2. We just need to scale them by the scale factor
+    3. Perform a standard matrix multiplication
+    
+    Args:
+        x: Input tensor of shape [..., in_features]
+        
+    Returns:
+        Output tensor of shape [..., out_features]
+    """
+    # Scale the binary weights (-1, 0, 1) by the scale factor
+    # The scale should be broadcasted across each output row (feature)
+    scaled_weight = self.weight * self.scale.reshape(-1, 1)
+    
+    # Standard matrix multiplication with the scaled binary weights
+    return x.linear(scaled_weight, self.bias)
 
   @staticmethod
   def unpack_i2_weights(data_bytes, shape):
