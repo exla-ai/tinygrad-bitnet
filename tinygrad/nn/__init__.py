@@ -190,14 +190,17 @@ class BitLinear:
         out_features: size of each output sample
         bias: If set to False, the layer will not learn an additive bias. Default: True
   """
-  # Constants for I2_S quantization from the C++ code
-  QK_K = 256  # Global block size constant
   QK_I2_S = 128  # Block size (K) for quantization (according to C++ code)
-  I2S_BLOCK_SIZE_BYTES = 32  # Size of one block in bytes (confirmed in C++ code)
+  I2S_BLOCK_SIZE_BYTES = QK_I2_S // 4  # 32 bytes per block
+  kmask_iq2xs = [0xC0, 0x30, 0x0C, 0x03]
+  kshift_iq2xs = [6, 4, 2, 0]
+  # Constants for I2_S quantization from the C++ code
+  # QK_K = 256  # Global block size constant
+  # I2S_BLOCK_SIZE_BYTES = 32  # Size of one block in bytes (confirmed in C++ code)
   
   # Masks for I2S quantization
-  kmask_iq2xs = [0xc0, 0x30, 0x0c, 0x03]  # Bit masks for 2-bit groups in a byte
-  kshift_iq2xs = [6, 4, 2, 0]  # Bit shifts for each group
+  # kmask_iq2xs = [0xc0, 0x30, 0x0c, 0x03]  # Bit masks for 2-bit groups in a byte
+  # kshift_iq2xs = [6, 4, 2, 0]  # Bit shifts for each group
   
   # Grid lookup table for I2_S quantization (populated by initialize_iq2s_grid)
   iq2s_grid_packed = None
@@ -325,7 +328,9 @@ class BitLinear:
     Performs block-wise dequantization via _parse_iq2s_block_tensor.
     """
     if self.raw_blocks is None:
-      return x.linear(self.weight.transpose(), self.bias)
+      # Dequantize stored 2-bit grid values by per-feature scale
+      W = self.weight * self.scale.unsqueeze(1)
+      return x.linear(W.transpose(), self.bias)
     orig_shape = x.shape
     # flatten leading dims
     x_flat = x.reshape(-1, self.in_features)

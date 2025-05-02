@@ -162,16 +162,18 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
 
   if not load_weights: return model
   # load weights
-  if model_path.is_dir():
-    if (model_path / "ggml-model-i2_s.gguf").exists(): weights = load(str(model_path / "ggml-model-i2_s.gguf"))
-    else: weights = concat_weights([load(str(model_path / f"consolidated.{i:02d}.pth")) for i in range(MODEL_PARAMS[model_size]["files"])], device[0] if isinstance(device, tuple) else device)
+  if model_path.is_dir() and (model_path / "ggml-model-i2_s.gguf").exists():
+    raw_weights = load(str(model_path / "ggml-model-i2_s.gguf"))
+    print("DEBUG: raw weights keys:", list(raw_weights.keys())[:20])
+    weights = convert_from_gguf(raw_weights, model)
+  elif model_path.is_dir():
+    weights = concat_weights([load(str(model_path / f"consolidated.{i:02d}.pth")) for i in range(MODEL_PARAMS[model_size]["files"])], device[0] if isinstance(device, tuple) else device)
+  elif model_path.suffix.lower() == ".gguf":
+    raw_weights = load(str(model_path))
+    print("DEBUG: raw weights keys:", list(raw_weights.keys())[:20])
+    weights = convert_from_gguf(raw_weights, model)
   else:
     weights = load(str(model_path))
-  if "token_embd.weight" in weights:
-    weights = convert_from_gguf(weights, model)
-  else:
-    raise ValueError("Currently only support converting from GGUF")
-  # weights = fix_bf16(weights)
 
   with Context(BEAM=0):
     # quantize
