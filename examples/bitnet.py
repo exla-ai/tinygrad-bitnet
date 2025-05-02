@@ -241,7 +241,7 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
   return model
 
 # default settings
-TEMPERATURE = 1.2
+TEMPERATURE = 0.0
 TOP_K = 0
 TOP_P = 0.0
 ALPHA_F = 0.2
@@ -289,6 +289,7 @@ if __name__ == "__main__":
   parser.add_argument("--count", type=int, default=1000, help="Max number of tokens to generate")
   parser.add_argument("--device", type=str, default=Device.DEFAULT, help="Device to use (e.g., METAL, CUDA, CPU)")
   args = parser.parse_args()
+
 
   # download_model is the default without a model passed in
   if args.download_model or not args.model:

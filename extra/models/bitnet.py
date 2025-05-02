@@ -139,10 +139,6 @@ def initialize_iq2s_grid():
     # 00 -> -1.0, 01 -> 0.0, 10 -> 1.0, 11 -> 0.0 (unused)
     # This is enough for our dequantization to work correctly
     BitLinear.iq2s_grid_packed = np.array([-1.0, 0.0, 1.0, 0.0], dtype=np.float32)
-    
-    print(f"Initialized I2_S value mapping table: 00 -> -1.0, 01 -> 0.0, 10 -> 1.0, 11 -> 0.0 (unused)")
-    print(f"Using simplified dequantization without grid lookups based on C++ implementation")
-
 
 def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
   assert logits.ndim == 1, "only works on 1d tensors"
@@ -276,10 +272,7 @@ def convert_from_gguf(weights: dict[str, Tensor], model: Transformer) -> dict[st
   import numpy as np
   from tinygrad.helpers import prod
     
-  # Initialize the I2S grid lookup table
-  if BitLinear.iq2s_grid_packed is None:
-    print("Initializing IQ2_S grid lookup table...")
-    initialize_iq2s_grid()
+  # previously initialized on-demand in unpack_i2_weights, manual init no longer needed
     
   # Expected dimensions directly from GGUF metadata, not calculated dimensions
   # The GGUF tensors are stored in [output_dim, input_dim] layout

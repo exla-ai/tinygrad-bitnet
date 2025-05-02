@@ -174,7 +174,7 @@ class Linear:
   def __init__(self, in_features:int, out_features:int, bias=True):
     bound = 1 / math.sqrt(in_features)
     self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
-    self.bias = Tensor.uniform(out_features, low=-bound, high=bound) if bias else None
+    self.bias: Tensor|None = Tensor.uniform(out_features, low=-bound, high=bound) if bias else None
 
   def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias)
 
@@ -322,24 +322,32 @@ class BitLinear:
   def __call__(self, x: Tensor) -> Tensor:
     """
     Execute the BitLinear transformation with I2_S quantized weights.
-    
-    For BitNet's 1.58-bit weights, this is actually simple:
-    1. The weight values are already unpacked to -1, 0, 1 when loaded
-    2. We just need to scale them by the scale factor
-    3. Perform a standard matrix multiplication
-    
-    Args:
-        x: Input tensor of shape [..., in_features]
-        
-    Returns:
-        Output tensor of shape [..., out_features]
+    Performs block-wise dequantization via _parse_iq2s_block_tensor.
     """
-    # Scale the binary weights (-1, 0, 1) by the scale factor
-    # The scale should be broadcasted across each output row (feature)
-    scaled_weight = self.weight * self.scale.reshape(-1, 1)
-    
-    # Standard matrix multiplication with the scaled binary weights
-    return x.linear(scaled_weight.T, self.bias)
+    if self.raw_blocks is None:
+      return x.linear(self.weight.transpose(), self.bias)
+    orig_shape = x.shape
+    # flatten leading dims
+    x_flat = x.reshape(-1, self.in_features)
+    # accumulator for output
+    out = Tensor.zeros(x_flat.shape[0], self.out_features, dtype=x.dtype, device=x.device)
+    # number of blocks
+    n_blocks = (self.in_features + self.QK_I2_S - 1) // self.QK_I2_S
+    for b in range(n_blocks):
+      # block slice
+      start = b * self.QK_I2_S; end = min((b + 1) * self.QK_I2_S, self.in_features)
+      x_block = x_flat[:, start:end]
+      # parse block: returns (scale, values, _)
+      block_scale, block_weights, _ = self._parse_iq2s_block_tensor(b)
+      # dequantize block weights
+      dequant = block_weights * block_scale
+      # accumulate matmul
+      out = out + x_block.dot(dequant.T)
+    # add bias if exists
+    if self.bias is not None:
+      out = out + self.bias.reshape(1, -1)
+    # restore original leading dims
+    return out.reshape(*orig_shape[:-1], self.out_features)
 
   @staticmethod
   def unpack_i2_weights(data_bytes, shape):
@@ -357,6 +365,9 @@ class BitLinear:
     import struct
     import numpy as np
     from tinygrad.helpers import prod
+    from extra.models.bitnet import initialize_iq2s_grid
+    if BitLinear.iq2s_grid_packed is None:
+      initialize_iq2s_grid()
     
     n = prod(shape)  # Total number of weights
     
@@ -389,15 +400,8 @@ class BitLinear:
                 shift = BitLinear.kshift_iq2xs[group_idx]
                 two_bit_val = (byte & mask) >> shift
                 
-                # Map the 2-bit value to -1, 0, 1
-                if two_bit_val == 0:
-                    val = -1.0
-                elif two_bit_val == 1:
-                    val = 0.0
-                elif two_bit_val == 2:
-                    val = 1.0
-                else:  # 3 (11) - unused in the format
-                    val = 0.0
+                # Map the 2-bit quantized value using the initialized grid
+                val = BitLinear.iq2s_grid_packed[two_bit_val]
                 
                 # Calculate the index in the weights array
                 idx = block_idx * QK_I2_S + group_idx * 32 + pos
