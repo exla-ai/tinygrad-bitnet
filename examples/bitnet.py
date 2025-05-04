@@ -213,18 +213,20 @@ def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dt
     weights = convert_from_huggingface(raw_weights, model, n_heads=MODEL_PARAMS[model_size]['args']['n_heads'], n_kv_heads=MODEL_PARAMS[model_size]['args']['n_kv_heads'])
   else:
     raise ValueError(f"Could not find model.safetensors in {model_path} or it is not a .safetensors file.")
-    
+  
+  print(list(raw_weights.keys()))
   weights = fix_bf16(weights)
   load_state_dict(model, weights, strict=False, consume=True)
-
+ 
   return model
 
 # default settings
-TEMPERATURE = 0.95
-TOP_K = 0
-TOP_P = 0.0
-ALPHA_F = 0.0
-ALPHA_P = 0.0
+TEMPERATURE = 0.0
+TOP_K       = 1
+TOP_P       = 1.0
+ALPHA_F     = 0.0
+ALPHA_P     = 0.0
+
 
 last_seen_toks = []
 def prefill(model, toks, start_pos=0):
@@ -356,7 +358,17 @@ if __name__ == "__main__":
 
       toks = [tokenizer.bos_id] + tokenizer.encode(rjson.get("prompt", ""), allow_special=True)
 
+
       start_pos = prefill(model, toks[:-1])
+
+      h = model.norm(model.tok_embeddings(Tensor([tokens], device=device)))
+      logits = model.output(h)[0,-1, :]
+
+      topk_vals, topk_idxs = logits.topk(5)
+      print("Top-5 candidate token IDs:", topk_idxs.tolist())
+      print("Corresponding scores      :", topk_vals.tolist())
+      print("Decoded strings          :", [tokenizer.decode([i]) for i in topk_idxs.tolist()])
+
       last_tok = toks[-1]
       while True:
         GlobalCounters.reset()
@@ -390,6 +402,7 @@ if __name__ == "__main__":
       try:
         print("[DEBUG] Starting chat_completions handler")
         global last_seen_toks
+        print(f"[DEBUG] stop_tokens = {tokenizer.stop_tokens}")
         rjson = json.loads(request.body.read())
         print(f"[DEBUG] Request JSON: {rjson}")
         if "messages" not in rjson: abort(400, "messages required")
@@ -415,7 +428,7 @@ if __name__ == "__main__":
 
         random_id = random.randbytes(16).hex()
         print(f"[DEBUG] Token sequence length: {len(toks)}")
-
+  
         print("[DEBUG] Starting prefill with token sequence")
         start_pos = prefill(model, toks[:-1])
 

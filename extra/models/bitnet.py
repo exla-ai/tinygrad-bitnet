@@ -176,15 +176,19 @@ def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
     sample.alpha_counter = (counter == output_token).where(sample.alpha_counter + 1, sample.alpha_counter)
 
   return output_token
-
-
 class Transformer:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_layers:int, norm_eps:float, vocab_size, linear=BitLinear, embedding=nn.Embedding,
                n_kv_heads=None, rope_theta=10000, max_context=1024, jit=True, feed_forward=FeedForward, qk_norm=None):
     self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear, feed_forward=feed_forward, qk_norm=qk_norm) for _ in range(n_layers)]
     self.norm = nn.RMSNorm(dim, norm_eps)
     self.tok_embeddings = embedding(vocab_size, dim)
-    self.output = linear(dim, vocab_size)
+    
+    self.lm_head    = nn.Linear(dim, vocab_size, bias=False)
+    self.lm_head.weight = self.tok_embeddings.weight
+
+    # alias output if you like
+    self.output = self.lm_head
+
     self.max_context = max_context
     self.freqs_cis = precompute_freqs_cis(dim // n_heads, self.max_context * 2, rope_theta).contiguous()
     self.forward_jit = TinyJit(self.forward) if jit else None
@@ -198,7 +202,8 @@ class Transformer:
 
     mask = Tensor.full((1, 1, seqlen, start_pos+seqlen), float("-inf"), dtype=h.dtype, device=h.device).triu(start_pos+1).realize() if seqlen > 1 else None
     for layer in self.layers: h = layer(h, start_pos, freqs_cis, mask)
-    logits = self.output(self.norm(h)).float()[:, -1, :]
+    logits = self.lm_head(self.norm(h)).float()[:, -1, :]
+
 
     return sample(logits.flatten(), temperature, top_k, top_p, alpha_f, alpha_p).realize()
 
