@@ -318,11 +318,13 @@ def convert_from_huggingface(weights:dict[str, Tensor], model: Transformer, n_he
     if ".rotary_emb." in k: continue
     v = v.to(Device.DEFAULT)
     if "model.layers" in k:
-      if ("q_proj" in k or "q_norm" in k) and permute_layers: v = permute(v, n_heads)
-      elif ("k_proj" in k or "k_norm" in k) and permute_layers: v = permute(v, n_kv_heads)
+      if "q_proj" in k and permute_layers and v.shape[0] % (n_heads * 2) == 0:
+        v = permute(v, n_heads)
+      elif "k_proj" in k and permute_layers and v.shape[0] % (n_kv_heads * 2) == 0:
+        v = permute(v, n_kv_heads)
 
     sd[keymap[k]] = v
-    return sd
+  return sd
 
   
 
