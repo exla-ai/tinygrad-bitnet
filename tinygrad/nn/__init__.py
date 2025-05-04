@@ -3,7 +3,7 @@ import math
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.device import is_dtype_supported
-from tinygrad.helpers import prod, make_tuple, flatten
+from tinygrad.helpers import make_tuple, flatten
 from tinygrad.nn import optim, state, datasets  # noqa: F401
 
 class BatchNorm:
@@ -104,7 +104,7 @@ class Conv2d:
       pad = [(d*(k-1)//2, d*(k-1) - d*(k-1)//2) for d,k in zip(make_tuple(dilation, len(self.kernel_size)), self.kernel_size[::-1])]
       padding = tuple(flatten(pad))
     self.stride, self.dilation, self.groups, self.padding = stride, dilation, groups, padding
-    scale = 1 / math.sqrt(in_channels * prod(self.kernel_size))
+    scale = 1 / math.sqrt(in_channels * self.kernel_size[0] * self.kernel_size[1])
     self.weight = Tensor.uniform(out_channels, in_channels//groups, *self.kernel_size, low=-scale, high=scale)
     self.bias: Tensor|None = Tensor.uniform(out_channels, low=-scale, high=scale) if bias else None
 
@@ -148,7 +148,7 @@ class ConvTranspose2d(Conv2d):
   def __init__(self, in_channels:int, out_channels:int, kernel_size:int|tuple[int, ...], stride=1, padding=0, output_padding=0,
                 dilation=1, groups=1, bias=True):
     super().__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
-    scale = 1 / math.sqrt(in_channels * prod(self.kernel_size))
+    scale = 1 / math.sqrt(in_channels * self.kernel_size[0] * self.kernel_size[1])
     self.weight = Tensor.uniform(in_channels, out_channels//groups, *self.kernel_size, low=-scale, high=scale)
     self.output_padding = output_padding
 
@@ -178,246 +178,112 @@ class Linear:
 
   def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias)
 
+# Constants
+VALUES_PER_ITEM = 4 # 4 values packed in uint8 (2 bits per value)
+
 class BitLinear:
-  """
-  Applies a bit-quantized linear transformation to the incoming data.
-  
-  BitLinear uses binary weights (-1, 1) for efficient computation with minimal memory footprint.
-  This is an implementation of the BitNet approach where weights are quantized to 1-bit.
-  
-  Args:
+    """
+    Applies a ternary-quantized linear transformation (Tinygrad version).
+    Weights are packed {-1, 0, 1} into uint8 (2 bits/val). Activations are int8 quantized.
+    Matches the structure from the provided PyTorch reference and safetensors manifest.
+
+    Args:
         in_features: size of each input sample
         out_features: size of each output sample
-        bias: If set to False, the layer will not learn an additive bias. Default: True
-  """
-  QK_I2_S = 128  # Block size (K) for quantization (according to C++ code)
-  I2S_BLOCK_SIZE_BYTES = QK_I2_S // 4  # 32 bytes per block
-  kmask_iq2xs = [0xC0, 0x30, 0x0C, 0x03]
-  kshift_iq2xs = [6, 4, 2, 0]
-  # Constants for I2_S quantization from the C++ code
-  # QK_K = 256  # Global block size constant
-  # I2S_BLOCK_SIZE_BYTES = 32  # Size of one block in bytes (confirmed in C++ code)
+        dtype: The target data type for weights and computation (e.g., dtypes.bfloat16). Default: dtypes.bfloat16
+    """
+    def __init__(self, in_features: int, out_features: int, dtype: dtypes.DType = dtypes.bfloat16):
+      self.in_features = in_features
+      self.out_features = out_features
+      self.dtype = dtype
+
+      self.weight = Tensor.zeros(in_features, out_features // VALUES_PER_ITEM, dtype=dtypes.uint8, requires_grad=False)
+
+      self.weight_scale = Tensor.ones(1, dtype=dtype, requires_grad=False)
+
+    def activation_quant(self, input: Tensor, num_bits: int = 8) -> tuple[Tensor, Tensor]:
+      Qn = -(2 ** (num_bits - 1))
+      Qp = 2 ** (num_bits - 1) -1
+      abs_input = input.abs()
+      max_val = abs_input.max(axis=-1, keepdim=True)
+      max_val = max_val.maximum(1e-5)
+      scale = Qp / max_val
+      result = (input * scale).round().clamp(Qn, Qp)
+      return result.cast(dtypes.int8), scale
+
+    def unpack_weights(self, packed: Tensor, dtype: dtypes.DType) -> Tensor:
+      """
+      Unpacks a tensor of quantized weights that were stored in a packed format using 2 bits per value.
+
+      Parameters:
+      -----------
+      packed : torch.Tensor
+          A tensor containing packed weights where each element represents 4 quantized values (using 2 bits per value).
+      dtype : torch.dtype
+          The dtype of the returned Tensor
+      Returns:
+      --------
+      torch.Tensor
+          A tensor of unpacked weights, where each value is converted from its packed 2-bit representation.
+
+      Example:
+      --------
+      packed = torch.tensor([[0b10100001, 0b00011000],
+                            [0b10010000, 0b00001010]], dtype=torch.uint8)
+
+      # Unpack the values
+      unpacked = unpack_weights(packed)
+
+      # Resulting unpacked tensor
+      print(unpacked)
+      # Output: tensor([[ 0, -1],
+                        [-1,  1],
+                        [-1,  1],
+                        [-1,  1],
+                        [ 1,  0],
+                        [ 0, -1],
+                        [ 1, -1],
+                        [ 1, -1]])
+
+      Explanation of the example:
+      ---------------------------
+      Let's take the first value for example 0b10100001, we we will only focus on the first column,
+      because every element is unpacked across the first dimension
+      - First 2 bits: `01` → 0 at [0][0]
+      - Second 2 bits: `00` → -1 at [0][2]
+      - Third 2 bits: `10` → 1 at [0][4]
+      - Fourth 2 bits: `10` → 1 at [0][6]
+      the second value of the same row (0b10010000) will give the values for [0][1], [0][3], [0][5], [0][7]
+
+      We subtract 1 because during the packing process, it's easier to work with values like 0, 1, and 2. To make this possible,
+      we add 1 to the original ternary weights (which are typically -1, 0, and 1) when packing them. When unpacking, we reverse
+      this by subtracting 1 to restore the original ternary values.
+      """
+      in_features, packed_out_features = packed.shape
+      out_features = packed_out_features * VALUES_PER_ITEM
+
+      unpacked = Tensor.zeros(in_features, out_features, device=packed.device, dtype=dtypes.int8).contiguous()
+
+      for i in range(VALUES_PER_ITEM):
+          mask = 3 << (2 * i)
+          shift = (packed & mask) >> (2 * i)
+          unpacked[:, i::VALUES_PER_ITEM] = shift
+
+      return unpacked - 1  # Maps {0, 1, 2} → {-1, 0, 1}
   
-  # Masks for I2S quantization
-  # kmask_iq2xs = [0xc0, 0x30, 0x0c, 0x03]  # Bit masks for 2-bit groups in a byte
-  # kshift_iq2xs = [6, 4, 2, 0]  # Bit shifts for each group
-  
-  # Grid lookup table for I2_S quantization (populated by initialize_iq2s_grid)
-  iq2s_grid_packed = None
-  
-  def __init__(self, in_features: int, out_features:int, bias=True):
-    bound = 1 / math.sqrt(in_features)
-    self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
-    self.bias = Tensor.uniform(out_features, low=-bound, high=bound) if bias else None
 
-    # Scale factor - will be loaded from quantized weights
-    # Use consistent naming - let's stick with "scale"
-    self.scale = Tensor.ones(out_features, dtype=dtypes.float32)  # One scale per output feature
-    
-    # For I2_S quantized weights storage in raw block format
-    self.raw_blocks = None  # Will be populated when loading weights
-    
-    self.in_features = in_features
-    self.out_features = out_features
+    def post_quant_process(self, input, input_scale, weight_scale):
+      out = input / (input_scale * weight_scale)
+      return out
 
-  def _quantize_row_q8_1_tensor(self, x: Tensor) -> tuple[Tensor, Tensor]:
-    """
-    Quantize a row to 8-bit integers and return scales.
-    Args:
-        x: Input tensor of shape [batch_size, in_features]
-    Returns:
-        Tuple of (quantized_tensor, scales)
-    """
-    print(f"[BitLinear._quantize_row_q8_1_tensor] Input shape={x.shape}, dtype={x.dtype}, stats: min={x.min().item():.6f}, max={x.max().item():.6f}, mean={x.mean().item():.6f}")
-    
-    # Get max absolute value for scaling
-    x_abs = x.abs()
-    print(f"[BitLinear._quantize_row_q8_1_tensor] x_abs shape={x_abs.shape}, stats: min={x_abs.min().item():.6f}, max={x_abs.max().item():.6f}, mean={x_abs.mean().item():.6f}")
-    
-    x_max = x_abs.max(axis=1, keepdim=True).clip(min=1e-5)  # Ensure non-zero scale
-    print(f"[BitLinear._quantize_row_q8_1_tensor] x_max shape={x_max.shape}, stats: min={x_max.min().item():.6f}, max={x_max.max().item():.6f}, mean={x_max.mean().item():.6f}")
-    
-    # Compute scale (1/max) and quantize
-    scale = 127.0 / x_max
-    print(f"[BitLinear._quantize_row_q8_1_tensor] scale shape={scale.shape}, stats: min={scale.min().item():.6f}, max={scale.max().item():.6f}, mean={scale.mean().item():.6f}")
-    
-    # Apply scaling and clipping
-    scaled_x = (x * scale)
-    print(f"[BitLinear._quantize_row_q8_1_tensor] scaled_x shape={scaled_x.shape}, stats: min={scaled_x.min().item():.6f}, max={scaled_x.max().item():.6f}, mean={scaled_x.mean().item():.6f}")
-    
-    # Round to nearest integer and clip to int8 range
-    rounded_x = scaled_x.round()
-    print(f"[BitLinear._quantize_row_q8_1_tensor] rounded_x shape={rounded_x.shape}, stats: min={rounded_x.min().item():.6f}, max={rounded_x.max().item():.6f}, mean={rounded_x.mean().item():.6f}")
-    
-    clipped_x = rounded_x.clip(-127, 127)
-    print(f"[BitLinear._quantize_row_q8_1_tensor] clipped_x shape={clipped_x.shape}, stats: min={clipped_x.min().item():.6f}, max={clipped_x.max().item():.6f}, mean={clipped_x.mean().item():.6f}")
-    
-    x_quant = clipped_x.cast(dtypes.int8)
-    print(f"[BitLinear._quantize_row_q8_1_tensor] x_quant shape={x_quant.shape}, dtype={x_quant.dtype}, stats: min={x_quant.min().item()}, max={x_quant.max().item()}, mean={x_quant.mean().item():.3f}")
-    
-    # Return inverse scale for dequantization later
-    inv_scale = 1.0 / scale
-    print(f"[BitLinear._quantize_row_q8_1_tensor] inv_scale shape={inv_scale.shape}, stats: min={inv_scale.min().item():.6f}, max={inv_scale.max().item():.6f}, mean={inv_scale.mean().item():.6f}")
-    
-    return x_quant, inv_scale
+    def __call__(self, input: Tensor) -> Tensor:
+      w = self.weight
+      w_quant = self.unpack_weights(w, dtype=self.dtype)
+      input_quant, input_scale = self.activation_quant(input)
+      y = input_quant.cast(self.dtype).linear(w_quant)
+      y = self.post_quant_process(y, self.weight_scale, input_scale)
+      return y
 
-  def _parse_iq2s_block_tensor(self, block_idx: int) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Parse an I2_S data block into tensors with scale, values and grid indices.
-    
-    Args:
-        block_idx: Index of the block to parse
-        
-    Returns:
-        Tuple of (scales, values, grid_indices)
-    """
-    print(f"[BitLinear._parse_iq2s_block_tensor] Starting for block_idx={block_idx}")
-    
-    if self.raw_blocks is None:
-      print(f"[BitLinear._parse_iq2s_block_tensor] ERROR: raw_blocks is None")
-      raise ValueError("No raw blocks data available. Model must be loaded from GGUF format.")
-    
-    print(f"[BitLinear._parse_iq2s_block_tensor] raw_blocks shape={self.raw_blocks.shape}, dtype={self.raw_blocks.dtype}")
-    
-    # Check if iq2s_grid_packed is initialized
-    if BitLinear.iq2s_grid_packed is None:
-      print(f"[BitLinear._parse_iq2s_block_tensor] WARNING: iq2s_grid_packed is None, dequantization will be incorrect")
-    else:
-      print(f"[BitLinear._parse_iq2s_block_tensor] iq2s_grid_packed shape={BitLinear.iq2s_grid_packed.shape}, dtype={BitLinear.iq2s_grid_packed.dtype}")
-    
-    # Placeholder - in a real implementation this would parse the raw block data
-    # and return the scales, binary values and grid indices for the block
-    # For now, just use the regular weights
-    block_size = self.QK_I2_S
-    start_idx = block_idx * block_size
-    end_idx = min((block_idx + 1) * block_size, self.weight.shape[1])
-    
-    print(f"[BitLinear._parse_iq2s_block_tensor] Block range: {start_idx} to {end_idx} (size {end_idx-start_idx})")
-    
-    # Mock implementation - extract a slice of the weight tensor for this block
-    block_weights = self.weight[:, start_idx:end_idx]
-    block_scale = self.scale.unsqueeze(1)
-    
-    print(f"[BitLinear._parse_iq2s_block_tensor] block_weights shape={block_weights.shape}, stats: min={block_weights.min().item():.6f}, max={block_weights.max().item():.6f}, mean={block_weights.mean().item():.6f}")
-    print(f"[BitLinear._parse_iq2s_block_tensor] block_scale shape={block_scale.shape}, stats: min={block_scale.min().item():.6f}, max={block_scale.max().item():.6f}, mean={block_scale.mean().item():.6f}")
-    
-    # Check what percentage of weights are non-zero
-    non_zero_percent = (block_weights != 0).sum().item() / block_weights.numel() * 100
-    print(f"[BitLinear._parse_iq2s_block_tensor] Non-zero weights: {non_zero_percent:.2f}%")
-    
-    # Debug the distribution of weight values in this block
-    if block_weights.numel() > 0:
-      unique_vals, counts = np.unique(block_weights.numpy(), return_counts=True)
-      print(f"[BitLinear._parse_iq2s_block_tensor] Unique values: {unique_vals[:10] if len(unique_vals) > 10 else unique_vals}")
-      print(f"[BitLinear._parse_iq2s_block_tensor] Value counts: {counts[:10] if len(counts) > 10 else counts}")
-    
-    # For I2_S, we should have mostly -1, 0, 1 values
-    if block_weights.numel() > 0:
-      neg_one_count = ((block_weights == -1).sum().item() / block_weights.numel() * 100)
-      zero_count = ((block_weights == 0).sum().item() / block_weights.numel() * 100)
-      pos_one_count = ((block_weights == 1).sum().item() / block_weights.numel() * 100)
-      print(f"[BitLinear._parse_iq2s_block_tensor] Value distribution: -1: {neg_one_count:.2f}%, 0: {zero_count:.2f}%, 1: {pos_one_count:.2f}%")
-      other_count = 100 - neg_one_count - zero_count - pos_one_count
-      print(f"[BitLinear._parse_iq2s_block_tensor] Other values: {other_count:.2f}%")
-    
-    return block_scale, block_weights, None
-    
-  def __call__(self, x: Tensor) -> Tensor:
-    """
-    Execute the BitLinear transformation with I2_S quantized weights.
-    Performs block-wise dequantization via _parse_iq2s_block_tensor.
-    """
-    if self.raw_blocks is None:
-      # Dequantize stored 2-bit grid values by per-feature scale
-      W = self.weight * self.scale.unsqueeze(1)
-      return x.linear(W.transpose(), self.bias)
-    orig_shape = x.shape
-    # flatten leading dims
-    x_flat = x.reshape(-1, self.in_features)
-    # accumulator for output
-    out = Tensor.zeros(x_flat.shape[0], self.out_features, dtype=x.dtype, device=x.device)
-    # number of blocks
-    n_blocks = (self.in_features + self.QK_I2_S - 1) // self.QK_I2_S
-    for b in range(n_blocks):
-      # block slice
-      start = b * self.QK_I2_S; end = min((b + 1) * self.QK_I2_S, self.in_features)
-      x_block = x_flat[:, start:end]
-      # parse block: returns (scale, values, _)
-      block_scale, block_weights, _ = self._parse_iq2s_block_tensor(b)
-      # dequantize block weights
-      dequant = block_weights * block_scale
-      # accumulate matmul
-      out = out + x_block.dot(dequant.T)
-    # add bias if exists
-    if self.bias is not None:
-      out = out + self.bias.reshape(1, -1)
-    # restore original leading dims
-    return out.reshape(*orig_shape[:-1], self.out_features)
-
-  @staticmethod
-  def unpack_i2_weights(data_bytes, shape):
-    """
-    Unpacks 2-bit quantized weights from raw bytes into a tensor of shape `shape`.
-    Based on the C++ implementation in the ggml-bitnet.cpp code.
-    
-    The quantization format works as follows:
-    - Values are represented using 2 bits: 00 -> -1, 01 -> 0, 10 -> 1 (11 is unused)
-    - Data is organized in blocks of 128 (QK_I2_S) elements
-    - Each block is 32 bytes, with each byte containing 4 2-bit values
-    - The bits are organized in specific positions: bits 6-7, 4-5, 2-3, 0-1
-    - A scale factor (float32) is stored after the data
-    """
-    import struct
-    import numpy as np
-    from tinygrad.helpers import prod
-    from extra.models.bitnet import initialize_iq2s_grid
-    if BitLinear.iq2s_grid_packed is None:
-      initialize_iq2s_grid()
-    
-    n = prod(shape)  # Total number of weights
-    
-    # Constants from the C++ code
-    QK_I2_S = BitLinear.QK_I2_S  # 128 elements per block
-    bytes_per_block = BitLinear.I2S_BLOCK_SIZE_BYTES  # 32 bytes per block
-    nb = n // QK_I2_S  # Number of full blocks
-    
-    # Calculate the size of the packed data (excluding the scale)
-    data_size = (n * 2 + 7) // 8  # Each element is 2 bits
-    
-    # Extract the scale factor (stored as float32 at the end)
-    scale = struct.unpack('f', data_bytes[data_size:data_size+4])[0]
-    
-    # Prepare the output array
-    weights = np.zeros(n, dtype=np.float32)
-    
-    # Process each block
-    for block_idx in range(nb):
-        # Each block contains 4 groups, each group has 32 elements
-        for group_idx in range(4):
-            # Process each of the 32 elements in this group
-            for pos in range(32):
-                # Find the byte index based on the C++ implementation
-                byte_idx = block_idx * bytes_per_block + pos
-                byte = data_bytes[byte_idx]
-                
-                # Extract the 2-bit value using the mask and shift for this group
-                mask = BitLinear.kmask_iq2xs[group_idx]
-                shift = BitLinear.kshift_iq2xs[group_idx]
-                two_bit_val = (byte & mask) >> shift
-                
-                # Map the 2-bit quantized value using the initialized grid
-                val = BitLinear.iq2s_grid_packed[two_bit_val]
-                
-                # Calculate the index in the weights array
-                idx = block_idx * QK_I2_S + group_idx * 32 + pos
-                if idx < n:  # Safety check to prevent out-of-bounds
-                    weights[idx] = val
-    
-    # Create tensors for weights and scale
-    weight_tensor = Tensor(weights.reshape(shape))
-    scale_tensor = Tensor([scale], dtype=dtypes.float32)
-    
-    return weight_tensor, scale_tensor
 
 class GroupNorm:
   """
@@ -590,3 +456,14 @@ class LSTMCell:
     new_c = f * hc[1] + i * g
     new_h = o * new_c.tanh()
     return (new_h.contiguous(), new_c.contiguous())
+
+def kaiming_uniform(tensor:Tensor, a:float = 0.0, mode:str = 'fan_in', nonlinearity:str = 'leaky_relu') -> Tensor:
+  bound = math.sqrt(6.0 / ((1.0 + a**2) * getattr(tensor, mode+'_size'))) / tensor.max().item()
+  return tensor.uniform(-bound, bound)
+
+def get_parameter(name:str, tensor:Tensor) -> Tensor:
+  # TODO: this requires a clear on init
+  tensor.requires_grad = True
+  setattr(tensor, 'name', name)
+  return tensor
+

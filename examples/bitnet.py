@@ -3,7 +3,8 @@ from typing import List
 import json, argparse, random, time, os
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
-from extra.models.bitnet import Transformer, convert_from_gguf, fix_bf16
+from extra.models.bitnet import Transformer, convert_from_huggingface
+from extra.models.llama import fix_bf16
 from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parameters, gguf_load
 from tinygrad import Tensor, dtypes, nn, Context, Device, GlobalCounters
 from tinygrad.helpers import Profiling, Timing, DEBUG, colored, fetch, tqdm, getenv, CI, JIT
@@ -155,99 +156,75 @@ MODEL_PARAMS = {
   }
 }
 
+def reshape_tensor_2d(tensor: Tensor, target_shape: tuple[int, int], key: str) -> Tensor:
+    """ Reshapes a 2D tensor to target_shape by padding with zeros or truncating. """
+    if tensor.shape == target_shape:
+        return tensor
+
+    print(f"DEBUG [reshape_tensor_2d] START {key}: shape {tensor.shape}, target {target_shape}")
+    current_shape = tensor.shape
+    target_rows, target_cols = target_shape
+    current_rows, current_cols = current_shape
+
+    # Pad or truncate rows
+    if current_rows < target_rows:
+        padding_rows = target_rows - current_rows
+        pad_tensor = Tensor.zeros(padding_rows, current_cols, dtype=tensor.dtype, device=tensor.device)
+        tensor = Tensor.cat(tensor, pad_tensor, dim=0)
+    elif current_rows > target_rows:
+        tensor = tensor[0:target_rows, 0:current_cols] # Fix slice syntax
+    print(f"DEBUG [reshape_tensor_2d] AFTER ROW ADJUST {key}: shape {tensor.shape}")
+
+    # Update current_cols after row adjustment affects slice range if truncated
+    current_cols = tensor.shape[1]
+
+    # Pad or truncate columns
+    if current_cols < target_cols:
+        padding_cols = target_cols - current_cols
+        pad_tensor = Tensor.zeros(tensor.shape[0], padding_cols, dtype=tensor.dtype, device=tensor.device) # Use current row count
+        tensor = Tensor.cat(tensor, pad_tensor, dim=1)
+    elif current_cols > target_cols:
+        tensor = tensor[0:tensor.shape[0], 0:target_cols] # Fix slice syntax
+    print(f"DEBUG [reshape_tensor_2d] AFTER COL ADJUST {key}: shape {tensor.shape}")
+
+    assert tensor.shape == target_shape, f"Reshaping failed for {key}: expected {target_shape}, got {tensor.shape}"
+    print(f"DEBUG [reshape_tensor_2d] END {key}: final shape {tensor.shape}")
+    return tensor.contiguous()
+
 def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dtype=dtypes.float16, device=None, max_context=8192, load_weights=True):
+  if quantize:
+    raise ValueError("Different quant types for BitNet not implemented")
+  
   # build model
-  linear, embedding, quantize_embeds = nn.BitLinear, nn.Embedding, False
+  linear, embedding = nn.BitLinear, nn.Embedding
   model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=linear, embedding=embedding, max_context=max_context, jit=True)
 
   if not load_weights: return model
   # load weights
-  if model_path.is_dir() and (model_path / "ggml-model-i2_s.gguf").exists():
-    raw_weights = load(str(model_path / "ggml-model-i2_s.gguf"))
-    print("DEBUG: raw weights keys:", list(raw_weights.keys())[:20])
-    weights = convert_from_gguf(raw_weights, model)
-  elif model_path.is_dir():
-    weights = concat_weights([load(str(model_path / f"consolidated.{i:02d}.pth")) for i in range(MODEL_PARAMS[model_size]["files"])], device[0] if isinstance(device, tuple) else device)
-  elif model_path.suffix.lower() == ".gguf":
-    raw_weights = load(str(model_path))
-    print("DEBUG: raw weights keys:", list(raw_weights.keys())[:20])
-    weights = convert_from_gguf(raw_weights, model)
+  sf_path = None
+  if model_path.is_file() and model_path.suffix.lower() == ".safetensors":
+    sf_path = model_path
+  elif model_path.is_dir() and (model_path / "model.safetensors").exists():
+    sf_path = model_path / "model.safetensors"
+
+  if sf_path:
+    print(f"Loading weights from {sf_path}")
+    raw_weights = load(str(sf_path))
+    weights = convert_from_huggingface(raw_weights, model, n_heads=MODEL_PARAMS[model_size]['args']['n_heads'], n_kv_heads=MODEL_PARAMS[model_size]['args']['n_kv_heads'])
   else:
-    weights = load(str(model_path))
-
-  with Context(BEAM=0):
-    # quantize
-    if quantize == "float16": weights = {k:v.cast(quantize).contiguous() for k,v in weights.items()}
-    elif quantize is not None:
-      weights = linear.quantize(weights, device, scale_dtype, quantize_embeds)
-      for _,v in weights.items(): v.realize()
-
-    # shard
-    if isinstance(device, tuple):
-      for k,v in nn.state.get_state_dict(model).items():
-        if 'scale' in k: v.shard_(device, axis=None)  # from quantized
-        elif '.attention.' in k: v.shard_(device, axis=-1)
-        elif '.feed_forward.w1.' in k: v.shard_(device, axis=0)
-        elif '.feed_forward.w3.' in k: v.shard_(device, axis=0)
-        elif '.feed_forward.' in k: v.shard_(device, axis=-1)
-        elif 'tok_embeddings.weight' in k: v.shard_(device, axis=0)
-        elif 'output.weight' in k: v.shard_(device, axis=0)
-        else: v.shard_(device, axis=None)
-
-    # Reshape weights that don't match the model's expected dimensions (for GGUF compatibility)
-    # This handles the mismatch between expected dimensions and actual GGUF dimensions
-    model_dict = nn.state.get_state_dict(model)
-    for k, v in list(weights.items()):
-      if k.endswith('.attention.wk.weight') or k.endswith('.attention.wv.weight'):
-        if v.shape[0] != model_dict[k].shape[0]:
-          print(f"Reshaping {k} from {v.shape} to match model's {model_dict[k].shape}")
-          # Use padding or truncation to make the weights match
-          if v.shape[0] < model_dict[k].shape[0]:
-            # Pad with zeros if GGUF dimension is smaller
-            padding = model_dict[k].shape[0] - v.shape[0]
-            pad_tensor = Tensor.zeros(padding, v.shape[1], dtype=v.dtype)
-            weights[k] = Tensor.cat(v, pad_tensor)
-          else:
-            # Truncate if GGUF dimension is larger
-            weights[k] = v[:model_dict[k].shape[0]]
-          
-          # Also handle the corresponding scale tensor
-          scale_key = k.replace('.weight', '.scale')
-          if scale_key in weights and scale_key in model_dict:
-            print(f"Reshaping {scale_key} from {weights[scale_key].shape} to match model's {model_dict[scale_key].shape}")
-            if weights[scale_key].shape[0] < model_dict[scale_key].shape[0]:
-              # Pad with ones if GGUF dimension is smaller
-              padding = model_dict[scale_key].shape[0] - weights[scale_key].shape[0]
-              pad_tensor = Tensor.ones(padding, dtype=weights[scale_key].dtype)
-              weights[scale_key] = Tensor.cat(weights[scale_key], pad_tensor)
-            else:
-              # Truncate if GGUF dimension is larger
-              weights[scale_key] = weights[scale_key][:model_dict[scale_key].shape[0]]
-      
-      # Handle feed-forward weights that need transposing
-      if '.feed_forward.w2.weight' in k:
-        if v.shape != model_dict[k].shape:
-          print(f"Transposing {k} from {v.shape} to match model's {model_dict[k].shape}")
-          weights[k] = v.transpose()
-          
-          # Also handle the corresponding scale tensor
-          scale_key = k.replace('.weight', '.scale')
-          if scale_key in weights and scale_key in model_dict:
-            print(f"Reshaping {scale_key} from {weights[scale_key].shape} to match model's {model_dict[scale_key].shape}")
-            # When we transpose the weights, we need to reorient the scales
-            if weights[scale_key].shape[0] != model_dict[scale_key].shape[0]:
-              weights[scale_key] = weights[scale_key][:model_dict[scale_key].shape[0]]
+    raise ValueError(f"Could not find model.safetensors in {model_path} or it is not a .safetensors file.")
     
-    # replace weights in model
-    load_state_dict(model, weights, strict=False, consume=True)
+  weights = fix_bf16(weights)
+  load_state_dict(model, weights, strict=False, consume=True)
+
   return model
 
 # default settings
-TEMPERATURE = 0.0
+TEMPERATURE = 0.95
 TOP_K = 0
 TOP_P = 0.0
-ALPHA_F = 0.2
-ALPHA_P = 0.2
+ALPHA_F = 0.0
+ALPHA_P = 0.0
 
 last_seen_toks = []
 def prefill(model, toks, start_pos=0):
@@ -295,8 +272,9 @@ if __name__ == "__main__":
 
   # download_model is the default without a model passed in
   if args.download_model or not args.model:
-    fetch("https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model", "tokenizer.model", subdir="bitnet") # bitnet uses the same tokenizer as llama3
-    args.model = fetch("https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf", "ggml-model-i2_s.gguf", subdir="bitnet")
+    # bitnet uses the same tokenizer as llama3
+    fetch("https://huggingface.co/bofenghuang/Meta-Llama-3-8B/resolve/main/original/tokenizer.model", "tokenizer.model", subdir="bitnet") 
+    args.model = fetch("https://huggingface.co/microsoft/bitnet-b1.58-2B-4T/resolve/main/model.safetensors", "model.safetensors", subdir="bitnet")
 
   assert args.model is not None, "please provide --model option"
 
@@ -310,6 +288,7 @@ if __name__ == "__main__":
   tokenizer_path = (model_dir / "tokenizer.model").resolve()
   if not tokenizer_path.is_file():
     raise FileNotFoundError(f"Tokenizer model not found at expected path: {tokenizer_path}")
+  
   tokenizer = Tokenizer(str(tokenizer_path))
 
   def encode_role(role: str):
@@ -439,6 +418,7 @@ if __name__ == "__main__":
 
         print("[DEBUG] Starting prefill with token sequence")
         start_pos = prefill(model, toks[:-1])
+
         print(f"[DEBUG] Prefill complete, start_pos = {start_pos}")
         last_tok = toks[-1]
         print(f"[DEBUG] Initial last_tok = {last_tok}")
