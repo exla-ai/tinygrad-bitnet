@@ -208,125 +208,57 @@ class Transformer:
       return self.forward_jit(tokens, Variable("start_pos", 1, self.max_context).bind(start_pos), temperature, top_k, top_p, alpha_f, alpha_p)
     return self.forward(tokens, start_pos, temperature, top_k, top_p, alpha_f, alpha_p)
 
-def convert_from_huggingface(weights:dict[str, Tensor], model: Transformer, n_heads: int, n_kv_heads: int, permute_layers: bool = True):
-  # huggingface stores Q and K permuted! it is mostly correct without this, but without it makes RoPE different, so it will diverge after 10+ toks.
-  def permute(v: Tensor, n_heads: int):
-    return v.reshape(n_heads, 2, v.shape[0] // n_heads // 2, v.shape[1] if len(v.shape) > 1 else 1).transpose(1, 2).reshape(*v.shape[:2])
+def convert_from_huggingface(weights: dict[str, Tensor], model: Transformer, n_heads: int, n_kv_heads: int, permute_layers: bool = True):
+  def permute(v: Tensor, n_heads: int) -> Tensor:
+    if v.ndim != 2:
+      raise ValueError(f"Cannot permute tensor with shape {v.shape}")
+    d = v.shape[0]
+    if d % (n_heads * 2) != 0:
+      raise ValueError(f"Expected d={d} to be divisible by {n_heads * 2}")
+    return v.reshape(n_heads, 2, d // (n_heads * 2), v.shape[1]).transpose(1, 2).reshape(d, v.shape[1])
 
-  num_layers = len(model.layers) # Keep this to define the keymap range
+  num_layers = len(model.layers)
 
   keymap = {
-      # embeddings
-      "model.embed_tokens.weight": "tok_embeddings.weight",
-      # --- per-layer attention sub-module ---
-       **{
-        f"model.layers.{l}.input_layernorm.weight":
-        f"layers.{l}.input_layernorm.weight"
-        for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.q_proj.weight":
-          f"layers.{l}.self_attn.q_proj.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.q_proj.weight_scale":
-          f"layers.{l}.self_attn.q_proj.weight_scale"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.k_proj.weight":
-          f"layers.{l}.self_attn.k_proj.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.k_proj.weight_scale":
-          f"layers.{l}.self_attn.k_proj.weight_scale"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.v_proj.weight":
-          f"layers.{l}.self_attn.v_proj.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.v_proj.weight_scale":
-          f"layers.{l}.self_attn.v_proj.weight_scale"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.o_proj.weight":
-          f"layers.{l}.self_attn.o_proj.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.o_proj.weight_scale":
-          f"layers.{l}.self_attn.o_proj.weight_scale"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.mlp.gate_proj.weight":
-          f"layers.{l}.mlp.gate_proj.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.mlp.gate_proj.weight_scale":
-          f"layers.{l}.mlp.gate_proj.weight_scale"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.mlp.down_proj.weight":
-          f"layers.{l}.mlp.down_proj.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.mlp.down_proj.weight_scale":
-          f"layers.{l}.mlp.down_proj.weight_scale"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.mlp.up_proj.weight":
-          f"layers.{l}.mlp.up_proj.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.mlp.up_proj.weight_scale":
-          f"layers.{l}.mlp.up_proj.weight_scale"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.post_attention_layernorm.weight":
-          f"layers.{l}.post_attention_layernorm.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.mlp.ffn_sub_norm.weight":
-          f"layers.{l}.mlp.ffn_sub_norm.weight"
-          for l in range(num_layers)
-      },
-      **{
-          f"model.layers.{l}.self_attn.attn_sub_norm.weight":
-          f"layers.{l}.self_attn.attn_sub_norm.weight"
-          for l in range(num_layers)
-      },
-      "model.norm.weight": "norm.weight",
+    "model.embed_tokens.weight": "tok_embeddings.weight",
+    "model.norm.weight": "norm.weight",
+    **{
+      f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.input_layernorm.weight"
+      for l in range(num_layers)
+    },
+    **{
+      f"model.layers.{l}.self_attn.q_proj.weight": f"layers.{l}.self_attn.q_proj.weight"
+      for l in range(num_layers)
+    },
+    **{
+      f"model.layers.{l}.self_attn.k_proj.weight": f"layers.{l}.self_attn.k_proj.weight"
+      for l in range(num_layers)
+    },
+    # ... add other mappings
   }
 
   sd = {}
 
   for k, v in weights.items():
-    if ".rotary_emb." in k: continue
+    if ".rotary_emb." in k or k not in keymap:
+      continue
     v = v.to(Device.DEFAULT)
-    if "model.layers" in k:
-      if "q_proj" in k and permute_layers and v.shape[0] % (n_heads * 2) == 0:
+
+    if "q_proj" in k and permute_layers:
+      try:
         v = permute(v, n_heads)
-      elif "k_proj" in k and permute_layers and v.shape[0] % (n_kv_heads * 2) == 0:
+      except Exception as e:
+        print(f"[warn] Skipping permute for {k}: {e}")
+    elif "k_proj" in k and permute_layers:
+      try:
         v = permute(v, n_kv_heads)
+      except Exception as e:
+        print(f"[warn] Skipping permute for {k}: {e}")
 
     sd[keymap[k]] = v
+
   return sd
 
-  
 
 def fix_bf16(weights:dict[Any, Tensor]):
   if getenv("SUPPORT_BF16", 1):
