@@ -71,14 +71,12 @@ ALPHA_P     = 0.0
 
 last_seen_toks = []
 def prefill(model, prompt_ids: List[int], past=None):
-    """Run a single forward pass to get the initial state."""
-    debug("Starting prefill with token sequence")
-    prompt_ids = Tensor([prompt_ids], device=Device.DEFAULT)
-    if past is None:
-        past = None
-    logits = model(prompt_ids, past=past)  # forward once
-    debug(f"Prefill complete, start_pos = {past}")
+  if not prompt_ids:
     return past
+  prompt_ids = Tensor([prompt_ids], device=Device.DEFAULT)
+  # model returns (logits, new_cache) when no sample_args are given
+  logits, past = model(prompt_ids, past)
+  return past
 
 
 if __name__ == "__main__":
@@ -278,7 +276,8 @@ if __name__ == "__main__":
             print(f"[DEBUG] Creating input tensor with shape [[{last_tok}]]")
             input_tensor = Tensor([[last_tok]], device=device)
             print(f"[DEBUG] Calling model with input tensor")
-            token_tensor, _, logits = model(input_tensor, start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+            token_tensor, _, logits = model(input_tensor,
+                                TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
             print(f"[DEBUG] Got token tensor {token_tensor}")
             print(f"[DEBUG] Got logits tensor with shape {logits.shape}, extracting item")
             token_id = token_tensor if isinstance(token_tensor, int) else token_tensor.item()

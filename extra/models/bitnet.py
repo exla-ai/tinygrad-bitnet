@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.nn import Embedding, Linear  # Linear only for lm_head
-from tinygrad.nn.state import load_state_dict
+from tinygrad.nn.state import load_state_dict, get_state_dict
 from tinygrad.helpers import DEBUG
 
 # ────────────────────────────────────────────────────────────
@@ -171,7 +171,8 @@ class BitLinear:
         self.weight = Tensor.zeros(
             (out_features // VALUES_PER_ITEM, in_features), dtype=dtypes.uint8, device=self.device
         )
-        self.weight_scale = Tensor.ones((1,), dtype=self.dtype, device=self.device)
+        self.weight_scale = Tensor.ones((1,), dtype=self.dtype,
+                                        device=self.device)
         self.bias = (
             Tensor.zeros((out_features,), dtype=self.dtype, device=self.device) if bias else None
         )
@@ -181,7 +182,7 @@ class BitLinear:
         w = unpack_weights(packed, dtype=self.dtype)
         x_q, x_scale = ActQuant.forward(x)
         mat = x_q.cast(self.dtype) @ w.T
-        y = mat * self.weight_scale / x_scale
+        y = mat / (x_scale * self.weight_scale)
         if self.bias is not None:
             y = y + self.bias
         return y
@@ -302,13 +303,20 @@ class BitNetForCausalLM:
         # weight tying
         self.lm_head.weight = self.model.embed.weight
 
-    def __call__(self, input_ids: Tensor, past=None, start_pos: int = 0, *sample_args):
-        hidden = self.model(input_ids, past)
-        logits = self.lm_head(hidden[:, -1, :].cast(dtypes.float32))[0]
+    def __call__(self, input_ids: Tensor, past=None, *sample_args):
+        # self.model is BitNetModel. It currently accepts 'past' but doesn't return an updated K/V cache.
+        # It only returns hidden_states.
+        hidden_states = self.model(input_ids, past)
+    
+        logits = self.lm_head(hidden_states[:, -1, :].cast(dtypes.float32))[0]
+    
+        # The 'past' returned here is the K/V cache state. Since BitNetModel
+        # doesn't update it yet, we return the 'past' that was passed into this call.
         if sample_args:
             token = sample(logits, *sample_args)
-            return token, None, logits  # K/V cache not implemented yet
-        return logits  # Return just logits if no sampling args provided
+            return token, past, logits 
+        else:  # (e.g. prefill)
+            return logits, past
 
 
 # ────────────────────────────────────────────────────────────
@@ -325,11 +333,16 @@ def _permute_qkv(v: Tensor, n_heads: int):
 
 
 def convert_from_huggingface(
-    weights: Dict[str, Tensor], n_heads: int, n_kv_heads: int, model: Any
+    raw_weights: Dict[str, Tensor], n_heads: int, n_kv_heads: int, model: Any
 ) -> Dict[str, Tensor]:
     debug("convert_from_huggingface")
+    print("[DEBUG] Checking for 'weight_scale' keys in raw HuggingFace weights:")
+    for k_raw_check in raw_weights.keys(): 
+        if "weight_scale" in k_raw_check:
+            print(f"  Found potential scale key in raw: {k_raw_check}")
+
     sd: Dict[str, Tensor] = {}
-    for k, v in weights.items():
+    for k, v in raw_weights.items():
         if k == "model.embed_tokens.weight":  # HuggingFace naming
             k = "model.embed.weight"
         v = v.to(Device.DEFAULT)
@@ -364,8 +377,43 @@ def build_transformer(model_path: Path, load_weights: bool = True):
     from tinygrad.nn.state import safe_load
 
     raw = safe_load(str(sf_path))
+    print("[DEBUG] Keys from raw safetensors load:")
+    for k_raw in raw.keys():
+        print(f"  raw key: {k_raw}")
+
     weights = convert_from_huggingface(
         raw, config.num_attention_heads, config.num_key_value_heads, net
     )
+    print("[DEBUG] Keys after convert_from_huggingface:")
+    for k_weights in weights.keys():
+        print(f"  converted key: {k_weights}")
+
+    key_to_check = "model.norm.weight"
+    print(f"\n[DEBUG] Before load_state_dict: Checking for '{key_to_check}'")
+    if key_to_check in weights:
+        print(f"[DEBUG] '{key_to_check}' IS IN weights. Value: {weights[key_to_check].numpy().flatten()[:5]}...") # Show first 5 values
+    else:
+        print(f"[DEBUG] '{key_to_check}' IS NOT IN weights.")
+
     load_state_dict(net, weights, strict=False, consume=True)
+
+    print(f"\n[DEBUG] After load_state_dict:")
+    print(f"[DEBUG] Remaining keys in weights dict (should be few/none if consume=True worked):")
+    for k_remaining in weights.keys():
+        print(f"  Remaining key: {k_remaining}")
+    if not weights:
+        print("[DEBUG] weights dict is empty, as expected with consume=True.")
+
+    print(f"[DEBUG] Checking model.norm.weight tensor in 'net' after load_state_dict:")
+    try:
+        loaded_norm_weight = get_state_dict(net)["norm.weight"]
+        print(f"[DEBUG] net.norm.weight (from get_state_dict): {loaded_norm_weight.numpy().flatten()[:5]}...")
+        # Also try direct access if possible, structure dependent
+        if hasattr(net, 'norm') and hasattr(net.norm, 'weight'):
+            print(f"[DEBUG] net.norm.weight (direct access): {net.norm.weight.numpy().flatten()[:5]}...")
+        else:
+            print("[DEBUG] Cannot directly access net.norm.weight for comparison.")
+    except Exception as e:
+        print(f"[DEBUG] Error accessing net.norm.weight after load: {e}")
+
     return net
