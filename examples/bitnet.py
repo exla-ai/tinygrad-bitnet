@@ -3,7 +3,7 @@ from typing import List
 import json, argparse, random, time, os
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
-from extra.models.bitnet import Transformer, convert_from_huggingface
+from extra.models.bitnet import BitNetConfig, BitNetForCausalLM, convert_from_huggingface, build_transformer, debug
 from extra.models.llama import fix_bf16
 from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parameters, gguf_load
 from tinygrad import Tensor, dtypes, nn, Context, Device, GlobalCounters
@@ -47,17 +47,6 @@ class Tokenizer:
   def encode(self, text, allow_special=False):
     return self.model.encode(text, allowed_special="all" if allow_special else set(), disallowed_special=set())
 
-# **** helper functions ****
-def concat_weights(models, device=None):
-  def convert(name) -> Tensor:
-    disk_tensors: List[Tensor] = [model[name] for model in models]
-    if len(disk_tensors) == 1 or len(disk_tensors[0].shape) == 1:
-      return disk_tensors[0].to(device=device)
-    axis = 1 if name.endswith((".attention.wo.weight", ".feed_forward.w2.weight")) else 0
-    lazy_tensors = [data.to(device=device) for data in disk_tensors]
-    return lazy_tensors[0].cat(*lazy_tensors[1:], dim=axis)
-  return {name: convert(name) for name in {name: None for model in models for name in model}}
-
 def load(fn:str):
   if fn.endswith('.index.json'):
     with open(fn) as fp: weight_map = json.load(fp)['weight_map']
@@ -71,154 +60,6 @@ def load(fn:str):
   else:
     return torch_load(fn)
 
-# **** quantized linears ****
-class Int8Linear:
-  def __init__(self, in_features, out_features, bias=False):
-    assert bias == False
-    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.int8)
-    self.scale = Tensor.ones(out_features, dtype=dtypes.half)
-
-  def __call__(self, x):
-    return x.dot(self.weight.cast(self.scale.dtype).T*self.scale)
-
-  @staticmethod
-  def quantize(tensors, device, scale_dtype=dtypes.float16, quantize_embeds=False):
-    new_tensors = {}
-    for name,v in tensors.items():
-      if "feed_forward" in name or "attention.w" in name or (quantize_embeds and "tok_embeddings.weight" in name):
-        assert "weight" in name, name
-        v = v.cast(scale_dtype)
-        scale = v.abs().max(axis=1) / 127.0
-        int8_weight = (v.T/scale).T.round().cast(dtype=dtypes.int8) # without round(), cast truncates -34.9 to -34
-        new_tensors[name] = int8_weight
-        new_tensors[name.replace('weight', 'scale')] = scale
-        if isinstance(device, tuple):
-          new_tensors[name].shard_(device, axis=-1)
-          new_tensors[name.replace('weight', 'scale')].shard_(device, axis=None)
-      else:
-        new_tensors[name] = v
-    if quantize_embeds: new_tensors.update({"output.weight": new_tensors["tok_embeddings.weight"], "output.scale": new_tensors["tok_embeddings.scale"]})
-    return new_tensors
-
-class Int8Embedding:
-  def __init__(self, vocab_size:int, embed_size:int):
-    self.vocab_sz, self.embed_sz = vocab_size, embed_size
-    self.weight, self.scale = Tensor.ones(vocab_size, embed_size, dtype=dtypes.int8), Tensor.ones(vocab_size, dtype=dtypes.half)
-
-  def __call__(self, idx:Tensor) -> Tensor:
-    if not hasattr(self, 'arange'): self.arange = Tensor.arange(self.vocab_sz, requires_grad=False, device=self.weight.device).unsqueeze(-1)
-    big_shp = idx.shape+(self.vocab_sz, self.embed_sz)
-    arange, idx, vals = self.arange.expand(big_shp), idx.reshape(idx.shape+(1, 1)).expand(big_shp), (self.weight.cast(self.scale.dtype).T*self.scale).T
-    return (arange == idx).mul(vals).sum(-2, dtype=vals.dtype)
-
-def NF4Linear(block_size):
-  _CODE = [
-    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
-  ]
-  CODE = Tensor.stack(*[Tensor(c, dtype=dtypes.float16) for c in _CODE])
-  class _NF4Linear:
-    def __init__(self, in_features, out_features, bias=False):
-      assert not bias, "bias not supported"
-      self.in_features, self.out_features = in_features, out_features
-      self.weight = Tensor.empty(int(out_features * in_features / 2), dtype=dtypes.uint8)
-      self.scale = Tensor.empty(int(out_features * in_features / block_size), 1, dtype=dtypes.float16)
-
-    def __call__(self, x: Tensor) -> Tensor:
-      high_bits = self.weight
-      low_bits = (self.weight * 2 ** 4).contiguous()
-      unpacked = Tensor.stack(high_bits, low_bits, dim=-1).idiv(2 ** 4)
-      unscaled = CODE[unpacked].to(x.device).reshape(-1, block_size) * self.scale
-      return x.linear(unscaled.reshape(self.out_features, self.in_features).T)
-
-    @staticmethod
-    def quantize(state_dict: dict[str, Tensor], device, scale_dtype=dtypes.float16) -> dict[str, Tensor]:
-      new_state_dict = {}
-      for k, v in state_dict.items():
-        if "feed_forward" in k or "attention.w" in k:
-          grouped = v.reshape(-1, block_size)
-          scale = (grouped.abs().max(axis=1, keepdim=True))
-          coded = ((grouped / scale).unsqueeze(-1) - CODE.to(v.device)).abs().argmin(axis=-1).cast(dtypes.uint8).flatten()
-          new_state_dict[k] = coded[::2] * 2 ** 4 + coded[1::2]
-          new_state_dict[k.replace(".weight", ".scale")] = scale.cast(scale_dtype)
-          if isinstance(device, tuple):
-            new_state_dict[k].shard_(device, axis=-1)
-            new_state_dict[k.replace('weight', 'scale')].shard_(device, axis=None)
-        else:
-          new_state_dict[k] = v
-      return new_state_dict
-  return _NF4Linear
-
-MODEL_PARAMS = {
-  "2B": {
-    "args": {"dim": 2560, "n_heads": 20, "n_kv_heads": 5, "n_layers": 30, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256, "hidden_dim": 6912},
-    "files": 1
-  }
-}
-
-def reshape_tensor_2d(tensor: Tensor, target_shape: tuple[int, int], key: str) -> Tensor:
-    """ Reshapes a 2D tensor to target_shape by padding with zeros or truncating. """
-    if tensor.shape == target_shape:
-        return tensor
-
-    print(f"DEBUG [reshape_tensor_2d] START {key}: shape {tensor.shape}, target {target_shape}")
-    current_shape = tensor.shape
-    target_rows, target_cols = target_shape
-    current_rows, current_cols = current_shape
-
-    # Pad or truncate rows
-    if current_rows < target_rows:
-        padding_rows = target_rows - current_rows
-        pad_tensor = Tensor.zeros(padding_rows, current_cols, dtype=tensor.dtype, device=tensor.device)
-        tensor = Tensor.cat(tensor, pad_tensor, dim=0)
-    elif current_rows > target_rows:
-        tensor = tensor[0:target_rows, 0:current_cols] # Fix slice syntax
-    print(f"DEBUG [reshape_tensor_2d] AFTER ROW ADJUST {key}: shape {tensor.shape}")
-
-    # Update current_cols after row adjustment affects slice range if truncated
-    current_cols = tensor.shape[1]
-
-    # Pad or truncate columns
-    if current_cols < target_cols:
-        padding_cols = target_cols - current_cols
-        pad_tensor = Tensor.zeros(tensor.shape[0], padding_cols, dtype=tensor.dtype, device=tensor.device) # Use current row count
-        tensor = Tensor.cat(tensor, pad_tensor, dim=1)
-    elif current_cols > target_cols:
-        tensor = tensor[0:tensor.shape[0], 0:target_cols] # Fix slice syntax
-    print(f"DEBUG [reshape_tensor_2d] AFTER COL ADJUST {key}: shape {tensor.shape}")
-
-    assert tensor.shape == target_shape, f"Reshaping failed for {key}: expected {target_shape}, got {tensor.shape}"
-    print(f"DEBUG [reshape_tensor_2d] END {key}: final shape {tensor.shape}")
-    return tensor.contiguous()
-
-def build_transformer(model_path: Path, model_size="2B", quantize=None, scale_dtype=dtypes.float16, device=None, max_context=8192, load_weights=True):
-  if quantize:
-    raise ValueError("Different quant types for BitNet not implemented")
-  
-  # build model
-  linear, embedding = nn.BitLinear, nn.Embedding
-  model = Transformer(**MODEL_PARAMS[model_size]["args"], linear=linear, embedding=embedding, max_context=max_context, jit=True)
-
-  if not load_weights: return model
-  # load weights
-  sf_path = None
-  if model_path.is_file() and model_path.suffix.lower() == ".safetensors":
-    sf_path = model_path
-  elif model_path.is_dir() and (model_path / "model.safetensors").exists():
-    sf_path = model_path / "model.safetensors"
-
-  if sf_path:
-    print(f"Loading weights from {sf_path}")
-    raw_weights = load(str(sf_path))
-    weights = convert_from_huggingface(raw_weights, model, n_heads=MODEL_PARAMS[model_size]['args']['n_heads'], n_kv_heads=MODEL_PARAMS[model_size]['args']['n_kv_heads'])
-  else:
-    raise ValueError(f"Could not find model.safetensors in {model_path} or it is not a .safetensors file.")
-  
-  print(list(raw_weights.keys()))
-  weights = fix_bf16(weights)
-  load_state_dict(model, weights, strict=False, consume=True)
- 
-  return model
 
 # default settings
 TEMPERATURE = 0.0
@@ -229,24 +70,16 @@ ALPHA_P     = 0.0
 
 
 last_seen_toks = []
-def prefill(model, toks, start_pos=0):
-  global last_seen_toks
+def prefill(model, prompt_ids: List[int], past=None):
+    """Run a single forward pass to get the initial state."""
+    debug("Starting prefill with token sequence")
+    prompt_ids = Tensor([prompt_ids], device=Device.DEFAULT)
+    if past is None:
+        past = None
+    logits = model(prompt_ids, past=past)  # forward once
+    debug(f"Prefill complete, start_pos = {past}")
+    return past
 
-  # we can skip part of the prompt if it is the same as last and start_pos=0
-  if start_pos == 0:
-    for i, (a, b) in enumerate(zip(toks, last_seen_toks)):
-      if a != b: break
-    else: i = min(len(toks), len(last_seen_toks))
-    start_pos += i
-    last_seen_toks = toks
-    toks = toks[i:]
-
-  # prefill the model
-  for tok in tqdm(toks):
-    GlobalCounters.reset()
-    model(Tensor([[tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P).realize()
-    start_pos += 1
-  return start_pos
 
 if __name__ == "__main__":
   Tensor.no_grad = True
@@ -256,7 +89,6 @@ if __name__ == "__main__":
   parser.add_argument("--model", type=Path, help="Path to the model directory or file")
   parser.add_argument("--size", type=str, default="2B", choices=['2B'], help="Size of model to use")
   parser.add_argument("--shard", type=int, default=1, help="Number of shards to use")
-  parser.add_argument("--quantize", type=str, choices=['int8', 'nf4', 'float16'], default=None, help="Quantize the weights to the specified type")
   parser.add_argument("--no_api", action="store_true", help="Do not start the Gradio API")
   parser.add_argument("--host", type=str, default="0.0.0.0", help="Web server bind address")
   parser.add_argument("--port", type=int, default=7776, help="Web server port")
@@ -302,7 +134,7 @@ if __name__ == "__main__":
 
   base_device = args.device
   device = tuple(f"{base_device}:{i}" for i in range(args.shard)) if args.shard > 1 else base_device
-  model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, device=device)
+  model = build_transformer(args.model)
 
   param_bytes = sum(x.lazydata.size * x.dtype.itemsize for x in get_parameters(model))
   print(f"ram used: {param_bytes/1e9:.2f} GB")
@@ -373,8 +205,10 @@ if __name__ == "__main__":
       while True:
         GlobalCounters.reset()
         token_tensor = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-        token_id = token_tensor.item()
+        token_id = token_tensor if isinstance(token_tensor, int) else token_tensor.item()
         print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
+        if start_pos is None: 
+            start_pos = len(toks) - 1
         start_pos += 1
         last_tok = token_id
         if last_tok in tokenizer.stop_tokens: break
@@ -444,10 +278,13 @@ if __name__ == "__main__":
             print(f"[DEBUG] Creating input tensor with shape [[{last_tok}]]")
             input_tensor = Tensor([[last_tok]], device=device)
             print(f"[DEBUG] Calling model with input tensor")
-            token_tensor = model(input_tensor, start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-            print(f"[DEBUG] Got token tensor with shape {token_tensor.shape}, extracting item")
-            token_id = token_tensor.item()
+            token_tensor, _, logits = model(input_tensor, start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
+            print(f"[DEBUG] Got token tensor {token_tensor}")
+            print(f"[DEBUG] Got logits tensor with shape {logits.shape}, extracting item")
+            token_id = token_tensor if isinstance(token_tensor, int) else token_tensor.item()
             print(f"[DEBUG] Generated token ID: {token_id}")
+            if start_pos is None: 
+                start_pos = len(toks) - 1
             start_pos += 1
             last_tok = token_id
             last_seen_toks.append(last_tok)
@@ -511,7 +348,7 @@ if __name__ == "__main__":
                       f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                       (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None):
             token_tensor = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-            token_id = token_tensor.item()
+            token_id = token_tensor if isinstance(token_tensor, int) else token_tensor.item()
             print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
           last_tok = token_id
       start_pos += 1
@@ -537,9 +374,11 @@ if __name__ == "__main__":
                         (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None, enabled=args.timing):
 
               token_tensor = model(Tensor([[last_tok]], device=device), start_pos, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P)
-              token_id = token_tensor.item()
+              token_id = token_tensor if isinstance(token_tensor, int) else token_tensor.item()
               print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
             last_tok = token_id
+        if start_pos is None: 
+            start_pos = len(toks) - 1
         start_pos += 1
         if last_tok in tokenizer.stop_tokens: break
         print(tokenizer.decode([last_tok]), end="", flush=True)
