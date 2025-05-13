@@ -171,26 +171,32 @@ class BitLinear:
         self.weight = Tensor.zeros(
             (out_features // VALUES_PER_ITEM, in_features), dtype=dtypes.uint8, device=self.device
         )
-        self.weight_scale = Tensor.ones((1,), dtype=self.dtype,
-                                        device=self.device)
+        
+        self.weight_scale = Tensor.ones((1,), dtype=self.dtype, device=self.device)
+
         self.bias = (
             Tensor.zeros((out_features,), dtype=self.dtype, device=self.device) if bias else None
         )
 
     def __call__(self, x: Tensor) -> Tensor:
-        packed = self.weight
-        w = unpack_weights(packed, dtype=self.dtype)
-        x_q, x_scale = ActQuant.forward(x)
-        mat = x_q.cast(self.dtype) @ w.T
-        y = mat / (x_scale * self.weight_scale)
+        # --- unpack & quantise ------------------------------------------------
+        w_ternary = unpack_weights(self.weight, dtype=self.dtype)          # (-1,0,1)
+        x_q, x_scale = ActQuant.forward(x)                                 # int8,  scale shape [B,1,1]
+
+        # --- int8 GEMM -------------------------------------------------------
+        mat = x_q.cast(self.dtype) @ w_ternary.T                           # ≈  scale * Σ(x*w)
+
+        # --- de-quant + rescale ---------------------------------------------
+        y = (mat / x_scale) * self.weight_scale                            # *** fixed line ***
+
         if self.bias is not None:
-            y = y + self.bias
+            y += self.bias
         return y
 
 
 class BitNetRMSNorm:
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        self.weight = Tensor.ones((hidden_size,), device=Device.DEFAULT)
+    def __init__(self, dim: int, eps: float = 1e-6):
+        self.weight = Tensor.ones((dim,), device=Device.DEFAULT)
         self.eps = eps
 
     def __call__(self, x: Tensor) -> Tensor:
@@ -204,12 +210,12 @@ class BitNetMLP:
         self.gate_proj = BitLinear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = BitLinear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = BitLinear(config.intermediate_size, config.hidden_size, bias=False)
-        self.ffn_norm = BitNetRMSNorm(config.intermediate_size, eps=config.rms_norm_eps)
+        self.ffn_sub_norm = BitNetRMSNorm(config.intermediate_size, eps=config.rms_norm_eps)
 
     def __call__(self, x: Tensor) -> Tensor:
         g = self.gate_proj(x).relu().square()
         u = self.up_proj(x)
-        inter = self.ffn_norm(g * u)
+        inter = self.ffn_sub_norm(g * u)
         return self.down_proj(inter)
 
 
@@ -267,32 +273,33 @@ class BitNetAttention:
 
 class BitNetDecoderLayer:
     def __init__(self, config: BitNetConfig):
-        self.input_norm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = BitNetAttention(config)
+        self.input_layernorm        = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attn_norm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = BitNetMLP(config)
+        self.self_attn = BitNetAttention(config)
 
     def __call__(self, x: Tensor, cos: Tensor, sin: Tensor):
-        x = x + self.self_attn(self.input_norm(x), cos, sin)
-        x = x + self.mlp(self.post_attn_norm(x))
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+        x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 
 class BitNetModel:
     def __init__(self, config: BitNetConfig):
-        self.embed = Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         self.layers = [BitNetDecoderLayer(config) for _ in range(config.num_hidden_layers)]
-        self.final_norm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm       = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary = BitNetRotaryEmbedding(config)
 
     def __call__(self, input_ids: Tensor, past=None):
-        x = self.embed(input_ids)
+        x = self.embed_tokens(input_ids)
         batch, seq = input_ids.shape
         pos = Tensor.arange(seq, device=x.device)[None, :].expand(batch, -1)
         cos, sin = self.rotary(x, pos)
         for layer in self.layers:
             x = layer(x, cos, sin)
-        return self.final_norm(x)
+        return self.norm(x)
 
 
 class BitNetForCausalLM:
@@ -301,7 +308,7 @@ class BitNetForCausalLM:
         self.model = BitNetModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         # weight tying
-        self.lm_head.weight = self.model.embed.weight
+        self.lm_head.weight = self.model.embed_tokens.weight
 
     def __call__(self, input_ids: Tensor, past=None, *sample_args):
         # self.model is BitNetModel. It currently accepts 'past' but doesn't return an updated K/V cache.
@@ -331,29 +338,81 @@ def _permute_qkv(v: Tensor, n_heads: int):
         .reshape(*v.shape[:2])
     )
 
-
 def convert_from_huggingface(
-    raw_weights: Dict[str, Tensor], n_heads: int, n_kv_heads: int, model: Any
+    raw: Dict[str, Tensor],
+    config: BitNetConfig,
 ) -> Dict[str, Tensor]:
-    debug("convert_from_huggingface")
-    print("[DEBUG] Checking for 'weight_scale' keys in raw HuggingFace weights:")
-    for k_raw_check in raw_weights.keys(): 
-        if "weight_scale" in k_raw_check:
-            print(f"  Found potential scale key in raw: {k_raw_check}")
 
-    sd: Dict[str, Tensor] = {}
-    for k, v in raw_weights.items():
-        if k == "model.embed_tokens.weight":  # HuggingFace naming
-            k = "model.embed.weight"
-        v = v.to(Device.DEFAULT)
+    # Define the key mapping
+    keymap = {
+        "model.embed_tokens.weight": "model.embed.weight",
+        "model.norm.weight": "model.final_norm.weight",
+    }
+
+    # Add layer-specific mappings
+    for l in range(config.num_hidden_layers):
+        # Layer Norms
+        keymap[f"model.layers.{l}.input_layernorm.weight"] = f"model.layers.{l}.input_norm.weight"
+        keymap[f"model.layers.{l}.post_attention_layernorm.weight"] = f"model.layers.{l}.post_attn_norm.weight"
+        
+        # Attention Projections (q, k, v, o) - Weights and Scales
+        for proj in ["q", "k", "v", "o"]:
+            keymap[f"model.layers.{l}.self_attn.{proj}_proj.weight"] = f"model.layers.{l}.self_attn.{proj}_proj.weight"
+            keymap[f"model.layers.{l}.self_attn.{proj}_proj.weight_scale"] = f"model.layers.{l}.self_attn.{proj}_proj.weight_scale"
+            
+        # Attention Sub Norm
+        keymap[f"model.layers.{l}.self_attn.attn_sub_norm.weight"] = f"model.layers.{l}.self_attn.attn_sub_norm.weight"
+        
+        # MLP Projections (gate, up, down) - Weights and Scales
+        for proj in ["gate", "up", "down"]:
+            keymap[f"model.layers.{l}.mlp.{proj}_proj.weight"] = f"model.layers.{l}.mlp.{proj}_proj.weight"
+            keymap[f"model.layers.{l}.mlp.{proj}_proj.weight_scale"] = f"model.layers.{l}.mlp.{proj}_proj.weight_scale"
+            
+        # MLP Sub Norm (ffn_norm in tinygrad)
+        keymap[f"model.layers.{l}.mlp.ffn_sub_norm.weight"] = f"model.layers.{l}.mlp.ffn_norm.weight"
+
+    out: Dict[str, Tensor] = {}
+    skipped_hf_keys = set() # Renamed for clarity
+    used_hf_keys_from_map = set() # Renamed for clarity
+
+    for hf_key, hf_tensor in raw.items(): # Iterate through raw Hugging Face weights
+        debug(f"Processing HF key: {hf_key}")
+        v = hf_tensor.to(Device.DEFAULT) # Use hf_tensor here
         if v.dtype == dtypes.bfloat16:
             v = Tensor(v.cast(dtypes.float32).numpy(), dtype=dtypes.float32)
-        if k.endswith("q_proj.weight"):
-            v = _permute_qkv(v, n_heads)
-        elif k.endswith("k_proj.weight"):
-            v = _permute_qkv(v, n_kv_heads)
-        sd[k] = v
-    return sd
+
+        # Permute Q/K weights specifically for attention layers, using the original hf_key for conditions
+        if hf_key.endswith("self_attn.q_proj.weight"):
+            debug(f"  Permuting Q weights for {hf_key}")
+            v = _permute_qkv(v, config.num_attention_heads)
+        elif hf_key.endswith("self_attn.k_proj.weight"):
+            debug(f"  Permuting K weights for {hf_key}")
+            v = _permute_qkv(v, config.num_key_value_heads)
+
+        if hf_key in keymap: # Check if the original hf_key is in our map
+            tg_key = keymap[hf_key]
+            out[tg_key] = v
+            used_hf_keys_from_map.add(hf_key)
+            debug(f"  Mapped HF key '{hf_key}' to tinygrad key '{tg_key}'")
+        else:
+            skipped_hf_keys.add(hf_key) # Add to skipped if not in keymap
+            debug(f"  Skipping HF key {hf_key} (not in keymap)")
+
+    # Report skipped keys
+    if skipped_hf_keys:
+        print(f"[WARNING] Skipped {len(skipped_hf_keys)} keys from HF checkpoint (not found in keymap or not mapped):")
+        for sk in sorted(list(skipped_hf_keys)):
+            print(f"  - {sk}")
+
+    # Check if all keys defined in the map were actually found in the HF checkpoint
+    unused_map_keys = set(keymap.keys()) - used_hf_keys_from_map
+    if unused_map_keys:
+        print(f"[WARNING] {len(unused_map_keys)} keys defined in keymap were NOT found in the HF checkpoint:")
+        for uk in sorted(list(unused_map_keys)):
+            print(f"  - {uk}")
+
+    return out
+
 
 
 # ────────────────────────────────────────────────────────────
@@ -365,7 +424,7 @@ def build_transformer(model_path: Path, load_weights: bool = True):
     net = BitNetForCausalLM(config)
 
     if not load_weights:
-        return net
+        return net, None
 
     sf_path = (
         model_path
@@ -377,43 +436,8 @@ def build_transformer(model_path: Path, load_weights: bool = True):
     from tinygrad.nn.state import safe_load
 
     raw = safe_load(str(sf_path))
-    print("[DEBUG] Keys from raw safetensors load:")
-    for k_raw in raw.keys():
-        print(f"  raw key: {k_raw}")
-
-    weights = convert_from_huggingface(
-        raw, config.num_attention_heads, config.num_key_value_heads, net
-    )
-    print("[DEBUG] Keys after convert_from_huggingface:")
-    for k_weights in weights.keys():
-        print(f"  converted key: {k_weights}")
-
-    key_to_check = "model.norm.weight"
-    print(f"\n[DEBUG] Before load_state_dict: Checking for '{key_to_check}'")
-    if key_to_check in weights:
-        print(f"[DEBUG] '{key_to_check}' IS IN weights. Value: {weights[key_to_check].numpy().flatten()[:5]}...") # Show first 5 values
-    else:
-        print(f"[DEBUG] '{key_to_check}' IS NOT IN weights.")
+    weights = convert_from_huggingface(raw, config)
 
     load_state_dict(net, weights, strict=False, consume=True)
 
-    print(f"\n[DEBUG] After load_state_dict:")
-    print(f"[DEBUG] Remaining keys in weights dict (should be few/none if consume=True worked):")
-    for k_remaining in weights.keys():
-        print(f"  Remaining key: {k_remaining}")
-    if not weights:
-        print("[DEBUG] weights dict is empty, as expected with consume=True.")
-
-    print(f"[DEBUG] Checking model.norm.weight tensor in 'net' after load_state_dict:")
-    try:
-        loaded_norm_weight = get_state_dict(net)["norm.weight"]
-        print(f"[DEBUG] net.norm.weight (from get_state_dict): {loaded_norm_weight.numpy().flatten()[:5]}...")
-        # Also try direct access if possible, structure dependent
-        if hasattr(net, 'norm') and hasattr(net.norm, 'weight'):
-            print(f"[DEBUG] net.norm.weight (direct access): {net.norm.weight.numpy().flatten()[:5]}...")
-        else:
-            print("[DEBUG] Cannot directly access net.norm.weight for comparison.")
-    except Exception as e:
-        print(f"[DEBUG] Error accessing net.norm.weight after load: {e}")
-
-    return net
+    return net, raw
