@@ -210,12 +210,11 @@ class BitNetMLP:
         self.gate_proj = BitLinear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = BitLinear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = BitLinear(config.intermediate_size, config.hidden_size, bias=False)
-        self.ffn_sub_norm = BitNetRMSNorm(config.intermediate_size, eps=config.rms_norm_eps)
 
     def __call__(self, x: Tensor) -> Tensor:
         g = self.gate_proj(x).relu().square()
         u = self.up_proj(x)
-        inter = self.ffn_sub_norm(g * u)
+        inter = g * u
         return self.down_proj(inter)
 
 
@@ -242,7 +241,6 @@ class BitNetAttention:
         self.k_proj = BitLinear(config.hidden_size, self.nkv * self.head_dim, bias=False)
         self.v_proj = BitLinear(config.hidden_size, self.nkv * self.head_dim, bias=False)
         self.o_proj = BitLinear(self.nh * self.head_dim, config.hidden_size, bias=False)
-        self.attn_sub_norm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _apply_rope(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         cos = cos.unsqueeze(1)
@@ -268,16 +266,15 @@ class BitNetAttention:
         probs = attn.softmax()
 
         out = (probs @ v).transpose(1, 2).reshape(b, s, -1)
-        return self.o_proj(self.attn_sub_norm(out))
+        return self.o_proj(out)
 
 
 class BitNetDecoderLayer:
     def __init__(self, config: BitNetConfig):
-        self.input_layernorm        = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attn_norm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = BitNetMLP(config)
+        self.input_layernorm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = BitNetAttention(config)
+        self.post_attention_layernorm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = BitNetMLP(config)
 
     def __call__(self, x: Tensor, cos: Tensor, sin: Tensor):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
@@ -289,7 +286,7 @@ class BitNetModel:
     def __init__(self, config: BitNetConfig):
         self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         self.layers = [BitNetDecoderLayer(config) for _ in range(config.num_hidden_layers)]
-        self.norm       = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary = BitNetRotaryEmbedding(config)
 
     def __call__(self, input_ids: Tensor, past=None):
@@ -311,18 +308,12 @@ class BitNetForCausalLM:
         self.lm_head.weight = self.model.embed_tokens.weight
 
     def __call__(self, input_ids: Tensor, past=None, *sample_args):
-        # self.model is BitNetModel. It currently accepts 'past' but doesn't return an updated K/V cache.
-        # It only returns hidden_states.
         hidden_states = self.model(input_ids, past)
-    
         logits = self.lm_head(hidden_states[:, -1, :].cast(dtypes.float32))[0]
-    
-        # The 'past' returned here is the K/V cache state. Since BitNetModel
-        # doesn't update it yet, we return the 'past' that was passed into this call.
         if sample_args:
             token = sample(logits, *sample_args)
             return token, past, logits 
-        else:  # (e.g. prefill)
+        else:
             return logits, past
 
 
@@ -342,75 +333,28 @@ def convert_from_huggingface(
     raw: Dict[str, Tensor],
     config: BitNetConfig,
 ) -> Dict[str, Tensor]:
-
-    # Define the key mapping
-    keymap = {
-        "model.embed_tokens.weight": "model.embed.weight",
-        "model.norm.weight": "model.final_norm.weight",
-    }
-
-    # Add layer-specific mappings
-    for l in range(config.num_hidden_layers):
-        # Layer Norms
-        keymap[f"model.layers.{l}.input_layernorm.weight"] = f"model.layers.{l}.input_norm.weight"
-        keymap[f"model.layers.{l}.post_attention_layernorm.weight"] = f"model.layers.{l}.post_attn_norm.weight"
-        
-        # Attention Projections (q, k, v, o) - Weights and Scales
-        for proj in ["q", "k", "v", "o"]:
-            keymap[f"model.layers.{l}.self_attn.{proj}_proj.weight"] = f"model.layers.{l}.self_attn.{proj}_proj.weight"
-            keymap[f"model.layers.{l}.self_attn.{proj}_proj.weight_scale"] = f"model.layers.{l}.self_attn.{proj}_proj.weight_scale"
-            
-        # Attention Sub Norm
-        keymap[f"model.layers.{l}.self_attn.attn_sub_norm.weight"] = f"model.layers.{l}.self_attn.attn_sub_norm.weight"
-        
-        # MLP Projections (gate, up, down) - Weights and Scales
-        for proj in ["gate", "up", "down"]:
-            keymap[f"model.layers.{l}.mlp.{proj}_proj.weight"] = f"model.layers.{l}.mlp.{proj}_proj.weight"
-            keymap[f"model.layers.{l}.mlp.{proj}_proj.weight_scale"] = f"model.layers.{l}.mlp.{proj}_proj.weight_scale"
-            
-        # MLP Sub Norm (ffn_norm in tinygrad)
-        keymap[f"model.layers.{l}.mlp.ffn_sub_norm.weight"] = f"model.layers.{l}.mlp.ffn_norm.weight"
-
     out: Dict[str, Tensor] = {}
-    skipped_hf_keys = set() # Renamed for clarity
-    used_hf_keys_from_map = set() # Renamed for clarity
+    # No keymap needed anymore if model names align with HF names after prefix stripping
 
-    for hf_key, hf_tensor in raw.items(): # Iterate through raw Hugging Face weights
-        debug(f"Processing HF key: {hf_key}")
-        v = hf_tensor.to(Device.DEFAULT) # Use hf_tensor here
+    for hf_key, hf_tensor in raw.items():
+        debug(f"Processing HF key for direct loading: {hf_key}")
+        v = hf_tensor.to(Device.DEFAULT)
         if v.dtype == dtypes.bfloat16:
+            # Cast to float32 for tinygrad operations if bf16 is not fully supported on backend
             v = Tensor(v.cast(dtypes.float32).numpy(), dtype=dtypes.float32)
 
-        # Permute Q/K weights specifically for attention layers, using the original hf_key for conditions
+        # Permute Q/K weights based on original HF key name
         if hf_key.endswith("self_attn.q_proj.weight"):
             debug(f"  Permuting Q weights for {hf_key}")
             v = _permute_qkv(v, config.num_attention_heads)
         elif hf_key.endswith("self_attn.k_proj.weight"):
             debug(f"  Permuting K weights for {hf_key}")
             v = _permute_qkv(v, config.num_key_value_heads)
+        
+        out[hf_key] = v # Use original HF key
 
-        if hf_key in keymap: # Check if the original hf_key is in our map
-            tg_key = keymap[hf_key]
-            out[tg_key] = v
-            used_hf_keys_from_map.add(hf_key)
-            debug(f"  Mapped HF key '{hf_key}' to tinygrad key '{tg_key}'")
-        else:
-            skipped_hf_keys.add(hf_key) # Add to skipped if not in keymap
-            debug(f"  Skipping HF key {hf_key} (not in keymap)")
-
-    # Report skipped keys
-    if skipped_hf_keys:
-        print(f"[WARNING] Skipped {len(skipped_hf_keys)} keys from HF checkpoint (not found in keymap or not mapped):")
-        for sk in sorted(list(skipped_hf_keys)):
-            print(f"  - {sk}")
-
-    # Check if all keys defined in the map were actually found in the HF checkpoint
-    unused_map_keys = set(keymap.keys()) - used_hf_keys_from_map
-    if unused_map_keys:
-        print(f"[WARNING] {len(unused_map_keys)} keys defined in keymap were NOT found in the HF checkpoint:")
-        for uk in sorted(list(unused_map_keys)):
-            print(f"  - {uk}")
-
+    # Warnings about skipped/unused keys are less relevant here,
+    # as load_state_dict with consume_prefix will handle mismatches.
     return out
 
 
@@ -438,6 +382,10 @@ def build_transformer(model_path: Path, load_weights: bool = True):
     raw = safe_load(str(sf_path))
     weights = convert_from_huggingface(raw, config)
 
-    load_state_dict(net, weights, strict=False, consume=True)
+    # Use consume_prefix to strip "model." and load into net.model
+    # strict=False will report missing/unexpected keys via consume_prefix's behavior
+    load_state_dict(net, weights, strict=False) 
+
+    
 
     return net, raw

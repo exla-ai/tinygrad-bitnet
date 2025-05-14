@@ -134,7 +134,7 @@ if __name__ == "__main__":
 
   base_device = args.device
   device = tuple(f"{base_device}:{i}" for i in range(args.shard)) if args.shard > 1 else base_device
-  model = build_transformer(args.model)
+  model = build_transformer(args.model)[0]
 
   param_bytes = sum(x.lazydata.size * x.dtype.itemsize for x in get_parameters(model))
   print(f"ram used: {param_bytes/1e9:.2f} GB")
@@ -264,7 +264,7 @@ if __name__ == "__main__":
         print(f"[DEBUG] Token sequence length: {len(toks)}")
   
         print("[DEBUG] Starting prefill with token sequence")
-        kv_cache = prefill(model, toks[:-1])      # Renamed and captures K/V cache
+        kv_cache = prefill(model, toks[:-1])   
         print(f"[DEBUG] Prefill complete, kv_cache obtained")
         last_tok = toks[-1]
         seq_pos = len(toks) - 1                   # Numeric cursor
