@@ -17,8 +17,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, dtypes, Device
 from extra.models.bitnet import BitNetConfig, build_transformer
+
+# Force CPU execution to avoid Metal resource limitations
+Device.DEFAULT = "CPU"
 
 #####################################################################
 # Paths — edit these two lines if your snapshot sits somewhere else  #
@@ -27,7 +30,7 @@ HF_PATH = (
     "/Users/viraat/.cache/huggingface/hub/models--microsoft--bitnet-b1.58-2B-4T/"
     "snapshots/5494d2858154ceb2b3854430366bf6d43d6ba5b5"
 )
-SAFETENSOR = os.path.join(HF_PATH, "model.safetensors")
+SAFETENSORS_PATH = os.path.join(HF_PATH, "model.safetensors")
 
 
 def to_numpy(x):
@@ -61,7 +64,7 @@ def main():
     hf_model = AutoModelForCausalLM.from_pretrained(HF_PATH, torch_dtype=torch.float32)
 
     config = BitNetConfig()
-    tg_model, raw_weights = build_transformer(Path(SAFETENSOR))
+    tg_model, raw_weights = build_transformer(Path(SAFETENSORS_PATH))
 
     ########################################
     # 2. Compare a single weight row       #
@@ -86,7 +89,9 @@ def main():
         logits_hf = hf_model(torch.tensor([prompt])).logits[0, -1]
 
     # temperature=0 → return (token, logprob, logits)
-    _, _, tg_logits = tg_model(Tensor([prompt], dtype=dtypes.int64), None, 0.0)
+    # Force tensor to CPU device to avoid Metal resource limitations
+    input_tensor = Tensor([prompt], dtype=dtypes.int64, device="CPU")
+    _, _, tg_logits = tg_model(input_tensor, None, 0.0)
 
     logits_max_err, _ = diff(logits_hf, tg_logits)
     print("\nLogits delta after prompt : %.6e" % logits_max_err)
