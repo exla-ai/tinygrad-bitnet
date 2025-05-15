@@ -51,27 +51,12 @@ class ActQuant:
 
     @staticmethod
     def forward(x: Tensor) -> Tuple[Tensor, Tensor]:
-        debug(f"ActQuant: x.shape={x.shape}, x.dtype={x.dtype}")
-        Qn, Qp = -(2 ** 7), 2 ** 7 - 1
-        debug(f"ActQuant: Quantization range: [{Qn}, {Qp}]")
-        
-        # Calculate max for scaling
-        max_abs = x.abs().max(axis=-1, keepdim=True).clamp(min_=1e-5)
-        debug(f"ActQuant: max_abs.shape={max_abs.shape}, min={max_abs.min().item() if max_abs.numel() > 0 else 'N/A'}, max={max_abs.max().item() if max_abs.numel() > 0 else 'N/A'}")
-        
-        # Scale calculation
-        scale = Qp / max_abs
-        debug(f"ActQuant: scale.shape={scale.shape}, min={scale.min().item() if scale.numel() > 0 else 'N/A'}, max={scale.max().item() if scale.numel() > 0 else 'N/A'}")
-        
-        # Quantization
-        q = (x * scale).round().clamp(Qn, Qp)
-        debug(f"ActQuant: q.shape={q.shape} (before cast), min={q.min().item() if q.numel() > 0 else 'N/A'}, max={q.max().item() if q.numel() > 0 else 'N/A'}")
-        
-        # Cast to int8 and return
-        q_int8 = q.cast(dtypes.int8)
-        debug(f"ActQuant: returning q_int8.dtype={q_int8.dtype}, scale.dtype={scale.dtype}")
-        
-        return q_int8, scale
+        Qn, Qp = -128, 127
+        max_abs = x.abs().max(axis=-1, keepdim=True).clamp(min_=1e-5).realize()
+        scale   = (Qp / max_abs).realize()              # ← 1st kernel
+        y       = (x * scale).realize()                 # ← 2nd kernel
+        q       = y.round().clamp(Qn, Qp).realize()     # ← 3rd kernel
+        return q.cast(dtypes.int8), scale
 
 
 # ────────────────────────────────────────────────────────────
