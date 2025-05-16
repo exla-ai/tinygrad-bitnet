@@ -44,7 +44,7 @@ class Tokenizer:
   @property
   def stop_tokens(self): return {self.special_tokens["<|end_of_text|>"], self.special_tokens["<|eot_id|>"]}
 
-  def decode(self, toks): return self.model.decode([t for t in toks if t < self.num_base_tokens])
+  def decode(self, toks): return self.model.decode(toks)
   def encode(self, text, allow_special=False):
     return self.model.encode(text, allowed_special="all" if allow_special else set(), disallowed_special=set())
 
@@ -73,10 +73,14 @@ ALPHA_P     = 0.0
 last_seen_toks = []
 def prefill(model, prompt_ids: List[int], past=None):
   if not prompt_ids:
+    print("[PREFILL] Empty prompt_ids, returning past cache")
     return past
+  print(f"[PREFILL] Processing {len(prompt_ids)} tokens: {prompt_ids}")
   prompt_ids = Tensor([prompt_ids], device=Device.DEFAULT)
+  print(f"[PREFILL] Prompt tensor shape: {prompt_ids.shape}")
   # model returns (logits, new_cache) when no sample_args are given
   logits, past = model(prompt_ids, past)
+  print(f"[PREFILL] Completed with logits shape: {logits.shape if hasattr(logits, 'shape') else 'N/A'}, cache size: {len(past) if past is not None else 'None'}")
   return past
 
 
@@ -336,11 +340,15 @@ if __name__ == "__main__":
     app.run(host=args.host, port=args.port, debug=args.debug)
   elif args.benchmark:
     toks = [tokenizer.bos_id] + encode_message("user", "Hello.") + encode_role("assistant")
+    print(f"[BENCHMARK] Initial tokens: {toks}")
+    print(f"[BENCHMARK] Initial text: '{tokenizer.decode(toks)}'")
     
     # Prefill step
+    print("[BENCHMARK] Starting prefill step...")
     kv_cache = prefill(model, toks[:-1])      # Renamed and captures K/V cache
     last_tok = toks[-1]
     seq_pos = len(toks) - 1                  # Numeric cursor
+    print(f"[BENCHMARK] Prefill complete, cursor at position {seq_pos}, last token: {last_tok}")
 
     total_time = 0
     print(f"Benchmarking generation of {args.count} tokens...")
@@ -349,7 +357,9 @@ if __name__ == "__main__":
         GlobalCounters.reset()
         st = time.perf_counter()
         
+        print(f"\n[BENCHMARK] Token {i+1}/{args.count} generation")
         input_tensor = Tensor([[last_tok]], device=device)
+        print(f"[BENCHMARK] Input tensor: shape={input_tensor.shape}, value={last_tok}")
         next_tok_val, kv_cache, _ = model( # Pass and receive kv_cache
             input_tensor,
             kv_cache,                # K/V cache as 2nd arg
@@ -359,7 +369,9 @@ if __name__ == "__main__":
             args.alpha_function,
             args.alpha_presence
         )
+        print(f"[BENCHMARK] Model output: {type(next_tok_val)}, value={'tensor' if isinstance(next_tok_val, Tensor) else next_tok_val}")
         next_tok = next_tok_val.item() if isinstance(next_tok_val, Tensor) else int(next_tok_val)
+        print(f"[BENCHMARK] Generated token: {next_tok}")
 
         seq_pos += 1   # Increment numeric cursor
 
@@ -378,16 +390,25 @@ if __name__ == "__main__":
 
   else:
     prompt = [tokenizer.bos_id] + encode_message("system", "You are an helpful assistant.")
+    print(f"[INIT] System prompt tokens: {prompt}")
+    print(f"[INIT] System prompt text: '{tokenizer.decode(prompt)}'")
 
     kv_cache = prefill(model, prompt)      # Renamed and captures K/V cache
     seq_pos = len(prompt) - 1                  # Numeric cursor
+    print(f"[INIT] Initialized with prompt length: {seq_pos+1} tokens")
 
     while True:
-      toks = encode_message("user", input("Q: ")) + encode_role("assistant")
+      user_input = input("Q: ")
+      print(f"[CHAT] User input: '{user_input}'")
+      toks = encode_message("user", user_input) + encode_role("assistant")
+      print(f"[CHAT] Encoded user message tokens: {toks}")
+      print(f"[CHAT] Encoded text: '{tokenizer.decode(toks)}'")
 
+      print("[CHAT] Starting prefill with user message...")
       kv_cache = prefill(model, toks[:-1], kv_cache)      # Pass and receive kv_cache
       last_tok = toks[-1]
       seq_pos = len(toks) - 1                  # Numeric cursor
+      print(f"[CHAT] Prefill complete, cursor at position {seq_pos}, last token: {last_tok}")
 
       while True:
         GlobalCounters.reset()
@@ -399,8 +420,11 @@ if __name__ == "__main__":
                         f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                         (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s, param {param_bytes*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None, enabled=args.timing):
 
+              print(f"\n[GENERATION] Processing token at position {seq_pos}, input token: {last_tok}")
+              input_tensor = Tensor([[last_tok]], device=device)
+              print(f"[GENERATION] Input tensor shape: {input_tensor.shape}")
               token_tensor, kv_cache, _ = model( # Pass and receive kv_cache
-                  Tensor([[last_tok]], device=device),
+                  input_tensor,
                   kv_cache,                # K/V cache as 2nd arg
                   args.temperature, 
                   args.top_k,
@@ -408,8 +432,10 @@ if __name__ == "__main__":
                   args.alpha_function,
                   args.alpha_presence
               )
+              print(f"[GENERATION] Raw model output: type={type(token_tensor)}, value={token_tensor if not isinstance(token_tensor, Tensor) else 'tensor'}")
               token_id = token_tensor if isinstance(token_tensor, int) else token_tensor.item()
-              print(f"  Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
+              print(f"[GENERATION] Generated token ID: {token_id}", file=sys.stderr) # Print ID to stderr
+              print(f"[GENERATION] Generated text segment: '{tokenizer.decode([token_id])}'")
             last_tok = token_id
         seq_pos += 1   # Increment numeric cursor
         if last_tok in tokenizer.stop_tokens: break

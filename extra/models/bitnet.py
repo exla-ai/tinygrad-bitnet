@@ -96,6 +96,7 @@ def sample(
     af: float = 0.0,
     ap: float = 0.0,
 ):
+    print(f"[SAMPLE] Input logits shape: {logits.shape}, temp={temp}, top_k={k}, top_p={p}")
     """Return **int** token id chosen from `logits`."""
 
     debug(
@@ -105,7 +106,9 @@ def sample(
 
     # Greedy / argmax path
     if temp < 1e-6:
-        return int(logits.argmax().item())
+        token = int(logits.argmax().item())
+        print(f"[SAMPLE] Greedy sampling result: token={token}")
+        return token
 
     if af or ap:
         if not hasattr(sample, "alpha_counter"):
@@ -115,6 +118,10 @@ def sample(
     # mask NaNs
     logits = (logits != logits).where(-float("inf"), logits)
     probs = (logits / temp).softmax()
+    print(f"[SAMPLE] After softmax: min={probs.min().item():.6f}, max={probs.max().item():.6f}")
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    print(f"[SAMPLE] Top 5 probs: {probs_sort[:5].flatten().numpy().tolist() if probs_sort.shape[0] >= 5 else 'less than 5 tokens'}")
+    print(f"[SAMPLE] Top 5 indices: {probs_idx[:5].flatten().numpy().tolist() if probs_idx.shape[0] >= 5 else 'less than 5 tokens'}")
 
     if k:
         values, indices = probs.topk(k)
@@ -134,6 +141,8 @@ def sample(
         )
 
     debug(f"sample: token={token}")
+
+    print(f"[SAMPLE] Final sampled token: {token}")
     return token
 
 
@@ -316,7 +325,10 @@ class BitNetAttention:
         # Exactly matches HF implementation: (q * cos) + (rotate_half(q) * sin)
         return (x * cos) + (rotate_half(x) * sin)
 
-    def __call__(self, x: Tensor, cos: Tensor, sin: Tensor):
+    def __call__(self, x: Tensor, cos: Tensor, sin: Tensor, past_key=None, past_value=None):
+        debug(f"BitNetAttention.__call__: x.shape={x.shape}, past_key={'present' if past_key is not None else 'None'}, past_value={'present' if past_value is not None else 'None'}")
+        print(f"[ATTENTION] Processing attention with input shape={x.shape}, past_key={'present' if past_key is not None else 'None'}, past_value={'present' if past_value is not None else 'None'}")
+        
         b, s, _ = x.shape
         q = self.q_proj(x).reshape(b, s, self.nh, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(b, s, self.nkv, self.head_dim).transpose(1, 2)
@@ -328,16 +340,43 @@ class BitNetAttention:
 
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
+        
+        # Handle KV cache if provided
+        if past_key is not None and past_value is not None:
+            # Concatenate current K/V with past K/V
+            print(f"[ATTENTION] Concatenating with past key shape={past_key.shape}, past value shape={past_value.shape}")
+            k = Tensor.cat(past_key, k, dim=2)
+            v = Tensor.cat(past_value, v, dim=2)
+            
+        # Save current K/V for later use
+        present_key = k
+        present_value = v
 
+        # Attention calculation
         attn = (q @ k.transpose(-1, -2)) * self.scale
-        mask = Tensor.tril(Tensor.ones(attn.shape[-2:], device=attn.device))
+        
+        # Create causal attention mask (if using past_key/past_value, we need to adjust the mask)
+        if past_key is not None:
+            # With past cache, we only need to mask within the current sequence
+            seq_start = past_key.shape[2]  # Past sequence length
+            seq_end = seq_start + s       # Total sequence length
+            mask = Tensor.ones((seq_end, seq_end), device=attn.device)
+            mask = Tensor.tril(mask)
+            # Only keep the rows corresponding to the current sequence
+            mask = mask[seq_start:seq_end, :]
+        else:
+            # Normal causal mask for the full sequence
+            mask = Tensor.tril(Tensor.ones(attn.shape[-2:], device=attn.device))
+        
         attn = attn.where(mask, Tensor.full_like(attn, -1e9))
         probs = attn.softmax()
 
         out = (probs @ v).transpose(1, 2).reshape(b, s, -1)
         # Apply attention sub-norm before the output projection, matching HF implementation
         out = self.attn_sub_norm(out)
-        return self.o_proj(out)
+        out = self.o_proj(out)
+        
+        return out, present_key, present_value
 
 
 class BitNetDecoderLayer:
@@ -347,12 +386,19 @@ class BitNetDecoderLayer:
         self.post_attention_layernorm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = BitNetMLP(config)
 
-    def __call__(self, x: Tensor, cos: Tensor, sin: Tensor):
+    def __call__(self, x: Tensor, cos: Tensor, sin: Tensor, past=None):
+        debug(f"BitNetDecoderLayer.__call__: x.shape={x.shape}, past={'present' if past is not None else 'None'}")
+        
+        # Unpack past state
+        past_key, past_value = past if past is not None else (None, None)
+        
         # Explicit residual connections matching HF implementation
         residual = x
         hidden_states = self.input_layernorm(x)
-        hidden_states = self.self_attn(hidden_states, cos, sin)
-        hidden_states = residual + hidden_states
+        
+        # Get attention output and updated K/V cache
+        attn_output, key_states, value_states = self.self_attn(hidden_states, cos, sin, past_key, past_value)
+        hidden_states = residual + attn_output
         
         # Second residual block for MLP
         residual = hidden_states
@@ -360,7 +406,8 @@ class BitNetDecoderLayer:
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        return hidden_states
+        # Return both the layer output and the updated KV cache
+        return hidden_states, (key_states, value_states)
 
 
 class BitNetModel:
@@ -371,29 +418,67 @@ class BitNetModel:
         self.rotary = BitNetRotaryEmbedding(config)
 
     def __call__(self, input_ids: Tensor, past=None):
+        debug(f"BitNetModel.__call__: input_ids.shape={input_ids.shape}, past is {'present' if past is not None else 'None'}")
+        print(f"[MODEL] BitNetModel call with input shape {input_ids.shape}, past is {'present' if past is not None else 'None'}")
+        
         x = self.embed_tokens(input_ids)
         batch, seq = input_ids.shape
         pos = Tensor.arange(seq, device=x.device)[None, :].expand(batch, -1)
         cos, sin = self.rotary(x, pos)
-        for layer in self.layers:
-            x = layer(x, cos, sin)
-        return self.norm(x)
+        
+        # Initialize or retrieve key-value cache
+        if past is None:
+            past_length = 0
+            # Initialize KV cache for all layers
+            past = [(None, None) for _ in range(len(self.layers))]
+        else:
+            past_length = past[0][0].shape[2] if past[0][0] is not None else 0
+        
+        print(f"[MODEL] Processing with past_length={past_length}, input_seq_length={seq}")
+        
+        # Track the updated KV cache
+        present = []
+        
+        # Process through all layers
+        for i, layer in enumerate(self.layers):
+            layer_past = past[i] if past is not None else None
+            x, layer_present = layer(x, cos, sin, layer_past)
+            present.append(layer_present)
+        
+        # Normalize the final hidden states
+        normalized_x = self.norm(x)
+        
+        debug(f"BitNetModel.__call__: completed with hidden_states.shape={normalized_x.shape}, cache size={len(present)}")
+        print(f"[MODEL] Returning hidden_states shape={normalized_x.shape}, cache size={len(present)}")
+        
+        return normalized_x, present
 
 
 class BitNetForCausalLM:
     def __init__(self, config: BitNetConfig):
-        self.config = config
+        print(f"[MODEL] Initializing BitNetForCausalLM with config: hidden_size={config.hidden_size}, vocab_size={config.vocab_size}")
         self.model = BitNetModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
-        # weight tying
+        self.config = config
+        print(f"[MODEL] BitNetForCausalLM initialized")
         self.lm_head.weight = self.model.embed_tokens.weight
 
     def __call__(self, input_ids: Tensor, past=None, *sample_args):
-        hidden_states = self.model(input_ids, past)
-        logits = self.lm_head(hidden_states[:, -1, :].cast(dtypes.float32))[0]
+        debug(f"BitNetForCausalLM.__call__: input_ids.shape={input_ids.shape}")
+        print(f"[MODEL-CALL] Input shape: {input_ids.shape}, past is {'present' if past is not None else 'None'}, args count: {len(sample_args)}")
+        past_len = past[0][0].shape[2] if past is not None else 0
+        print(f"[MODEL-CALL] Past length: {past_len}")
+        outputs = self.model(input_ids, past)
+        hidden_states, present = outputs
+        debug(f"BitNetForCausalLM.__call__: hidden_states.shape={hidden_states.shape}")
+        print(f"[MODEL-CALL] Hidden states shape: {hidden_states.shape}")
+        logits = self.lm_head(hidden_states)
+        debug(f"BitNetForCausalLM.__call__: logits.shape={logits.shape}")
+        print(f"[MODEL-CALL] Logits shape: {logits.shape}, min={logits.min().item():.3f}, max={logits.max().item():.3f}")
         if sample_args:
-            token = sample(logits, *sample_args)
-            return token, past, logits 
+            # Just return logits if no sample_args
+            token = sample(logits[0, -1, :], *sample_args) # Pass 1D logits (vocab_size,) for the current token
+            return token, present, logits # Return updated KV cache 
         else:
             return logits, past
 
