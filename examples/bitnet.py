@@ -13,6 +13,9 @@ import sys
 
 from tokenizers import Tokenizer as HFTokenizer
 
+# Debug prints for device information
+print("[DEBUG-DEVICE] Device.DEFAULT:", Device.DEFAULT)
+
 
 class Tokenizer:
   pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
