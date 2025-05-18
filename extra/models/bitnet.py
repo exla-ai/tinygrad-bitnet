@@ -685,11 +685,12 @@ class BitNetAttention:
         self.k_proj = BitLinear(config.hidden_size, 160, bias=False)
         self.v_proj = BitLinear(config.hidden_size, 160, bias=False)
         
-        # The o_proj layer - weights will be transposed during loading in build_transformer
-        # State dict has weights as (640, 2560), but we'll transpose to (2560, 640) before loading
-        print("[DEBUG-ATTENTION] Creating o_proj layer with in_features=640, out_features=2560")
-        self.o_proj = BitLinear(640, config.hidden_size, bias=False)
-        print(f"[DEBUG-ATTENTION] Expected o_proj weight shape: {self.o_proj.weight.shape}")
+        # The o_proj layer should be initialized as BitLinear(hidden_size, hidden_size)
+        # Based on the model architecture, o_proj takes the output of all attention heads
+        # and projects it back to hidden_size
+        print(f"[DEBUG-ATTENTION] Creating o_proj layer with in_features={config.hidden_size}, out_features={config.hidden_size}")
+        self.o_proj = BitLinear(config.hidden_size, config.hidden_size, bias=False)
+        print(f"[DEBUG-ATTENTION] Expected o_proj weight shape after init: {self.o_proj.weight.shape}")
         # Add attention sub-norm just like HF implementation
         self.attn_sub_norm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -734,9 +735,9 @@ class BitNetAttention:
         
         # Handle KV cache for incremental decoding
         if past_key is not None and past_value is not None:
-            # Combine with past key/value for incremental decoding
-            k = Tensor.cat(past_key, k, dim=2)
-            v = Tensor.cat(past_value, v, dim=2)
+            # Combine with past key/value for incremental decoding (using instance method for cat)
+            k = past_key.cat(k, dim=2)
+            v = past_value.cat(v, dim=2)
         
         # Store current key, value for next token
         present_key, present_value = k, v
@@ -808,120 +809,11 @@ class BitNetAttention:
         
         print(f"[DEBUG-ATTN-FORWARD] o_proj.weight shape: {self.o_proj.weight.shape}")
         
-        # Handle o_proj layer with a completely custom implementation to avoid dimension issues
-        print(f"[DEBUG-CUSTOM] o_proj handling with input shape: {out.shape}")
+        # Apply the output projection layer
+        attn_output = self.o_proj(out)
+        print(f"[DEBUG-ATTN-FORWARD] Final output from o_proj: {attn_output.shape}")
         
-        # We'll avoid using BitLinear.__call__ completely and implement the matrix multiply ourselves
-        b, s, h = out.shape
-        out_flat = out.reshape(b*s, h)  # Flatten to 2D for easier matrix multiplication
-        
-        # Get weight parameters
-        weight = self.o_proj.weight
-        weight_scale = self.o_proj.weight_scale.item() if self.o_proj.weight_scale.numel() == 1 else self.o_proj.weight_scale
-        
-        # Simplified activation quantization to avoid the 'not enough values to unpack' error
-        # Just use a fixed scale instead of computing max values
-        fixed_scale = 0.1
-        out_scale = Tensor.ones(out_flat.shape[0], 1) * fixed_scale
-        out_q = (out_flat / fixed_scale).round().clamp(-128, 127).cast(dtypes.int8).cast(dtypes.float)
-        
-        print(f"[DEBUG-CUSTOM] Quantized input shape: {out_q.shape}, scale shape: {out_scale.shape}")
-        
-        # Since we know the weights should be (2560, 640), slice the packed weights to ensure correct dimensions
-        # This avoids the problematic 10240x640 unpacked shape
-        if weight.dtype == dtypes.uint8:
-            # We need to slice the weight to the correct dimensions (2560, 640)
-            # and manually unpack the weights to avoid creating the huge matrix
-            print(f"[DEBUG-CUSTOM] Original weight shape: {weight.shape}")
-            
-            # Create fixed weight for matrix multiplication
-            # We'll use a custom implementation that uses the correct dimensions
-            w_temp = weight[:h, :640].contiguous()  # Use only the dimensions we need
-            print(f"[DEBUG-CUSTOM] Sliced weight shape: {w_temp.shape}")
-            
-            # Use sliced direct weights instead of trying to manually unpack
-            # This is a simplified approach to avoid the weight dimension issue
-            print(f"[DEBUG-CUSTOM] Using direct matrix multiply with original weights")
-            
-            try:
-                # Perform direct matrix multiplication with correct dimensions
-                # out_flat shape is (b*s, 2560)
-                # We need a dot product that gives us (b*s, 640) as output
-                # So we need to properly transpose w_temp to get (2560, 640)
-                
-                # Debug the actual shapes we're working with
-                print(f"[DEBUG-CUSTOM] out_flat shape: {out_flat.shape}, w_temp shape: {w_temp.shape}")
-                
-                # The issue is that w_temp is shape (2560, 640) but we need it properly oriented for matmul
-                # out_flat is shape (1, 2560) and we want result to be (1, 640)
-                try:
-                    # Debug the matrix shape in detail
-                    print(f"[DEBUG-WEIGHT] w_temp data type: {w_temp.dtype}, shape dimensions: {w_temp.shape}")
-                    
-                    # Fix #1: Handle the case where w_temp shape is (2560, 640)
-                    # We need out_flat @ w_proper where w_proper is (2560, 640)
-                    # This is a direct multiplication without transposing
-                    w_float = w_temp.cast(dtypes.float) * weight_scale
-                    out_result = out_flat @ w_float
-                    print(f"[DEBUG-CUSTOM] Direct matrix multiply result shape: {out_result.shape}")
-                except Exception as e:
-                    print(f"[DEBUG-CUSTOM] Matrix multiply failed: {e}, trying alternative approach")
-                    
-                    # Fix #2: Try an alternative approach with a hardcoded matrix
-                    # Create a small random matrix with guaranteed compatible dimensions
-                    try:
-                        random_weight = Tensor.randn(2560, 640, device=out_flat.device) * 0.01
-                        out_result = out_flat @ random_weight
-                        print(f"[DEBUG-CUSTOM] Random weight matrix worked, result shape: {out_result.shape}")
-                    except Exception as e2:
-                        # Ultimate fallback - use zeros which will just preserve the residual connection
-                        print(f"[DEBUG-CUSTOM] Random matrix also failed: {e2}, using zeros")
-                        out_result = Tensor.zeros(out_flat.shape[0], 640, device=out_flat.device)
-                    
-                print(f"[DEBUG-CUSTOM] Direct matrix multiply result shape: {out_result.shape}")
-            except Exception as e:
-                print(f"[DEBUG-CUSTOM] Error in custom o_proj: {e}, falling back to zeros + residual")
-                # Emergency fallback - use zeros of the right shape which will leave just the residual
-                # This is better than crashing - the residual path will still provide some signal
-                out_result = Tensor.zeros(out_flat.shape[0], 2560)
-            
-            # Everything is handled in the try-except block above
-            # No additional processing needed
-        else:
-            # Fallback for non-quantized weights
-            out_result = out_flat @ weight.T
-        
-        # Reshape back to 3D tensor
-        out = out_result.reshape(b, s, -1)
-        
-        # Fix the dimension mismatch caused by unpacked weights
-        expected_size = 2560  # The model's hidden size
-        
-        if out.shape[2] != expected_size:
-            print(f"[DEBUG-CUSTOM] Dimension mismatch: {out.shape[2]} vs expected {expected_size}. Fixing...")
-            
-            # If output is 4x too large (10240), reshape and average across the 4 chunks
-            if out.shape[2] == 10240:  # 4 * 2560
-                factor = 4
-                out = out.reshape(b, s, factor, expected_size).mean(axis=2).realize()
-                print(f"[DEBUG-CUSTOM] Fixed by averaging {factor} chunks → {out.shape}")
-            elif out.shape[2] < expected_size:
-                # Handle the case where output is too small (640 vs 2560)
-                # Approach 1: Use concatenation instead of direct assignment
-                padding_size = expected_size - out.shape[2]
-                padding = Tensor.zeros(b, s, padding_size, device=out.device)
-                # Concat the original output with zeros to reach expected size
-                out = out.cat(padding, dim=2).contiguous()
-                print(f"[DEBUG-CUSTOM] Fixed by concatenating padding to {expected_size} features")
-            elif out.shape[2] > expected_size:
-                # For any other mismatch, truncate
-                out = out[:, :, :expected_size].realize()
-                print(f"[DEBUG-CUSTOM] Fixed by truncating to {expected_size} features")
-        
-        print(f"[DEBUG-CUSTOM] Final output shape: {out.shape}")
-        print(f"[DEBUG-ATTN-FORWARD] Final output: {out.shape}")
-        
-        return out, present_key, present_value
+        return attn_output, present_key, present_value
 
 
 class BitNetDecoderLayer:
@@ -1075,6 +967,19 @@ def convert_from_huggingface(
             debug(f"  Permuting K weights for {hf_key}, before shape={v.shape}")
             v = _permute_qkv(v, config.num_key_value_heads)
             debug(f"  After permutation: shape={v.shape}")
+        # o_proj.weight: BitLinear(2560, 2560) expects shape (2560, 2560) during state_dict loading
+        # The Hugging Face weights are packed with shape (640, 2560) and need to be unpacked
+        elif hf_key.endswith("self_attn.o_proj.weight"):
+            debug(f"  Processing O weights for {hf_key}, original shape={v.shape}")
+            if v.shape[0] == 640 and config.hidden_size == 2560:
+                # We need to unpack the weights from (640, 2560) to (2560, 2560)
+                debug(f"  Unpacking o_proj weights from {v.shape} to (2560, 2560)")
+                # Use the unpack_weights function to convert packed 2-bit weights to unpacked format
+                v = unpack_weights(v, dtypes.float32)
+                debug(f"  After unpacking: shape={v.shape}, dtype={v.dtype}")
+            else:
+                debug(f"  O weights have unexpected shape: {v.shape}")
+                # If shape isn't as expected, we'll keep original weights, but this might cause issues
         
         out[hf_key] = v # Use original HF key
 
@@ -1132,19 +1037,9 @@ def build_transformer(model_path: Path, load_weights: bool = True):
             gate_weight = weights['model.layers.0.mlp.gate_proj.weight']
             debug(f"Weight stats: min={gate_weight.min().item():.6f}, max={gate_weight.max().item():.6f}, mean={gate_weight.mean().item():.6f}")
     
-    # Preprocess weights by transposing all o_proj weights to match expected model shape (2560, 640) from (640, 2560)
-    # Loop through all layers and transpose their o_proj weights
-    print("\n[DEBUG-WEIGHTS] Starting o_proj weight transposition for all layers")
-    for i in range(30):  # There are 30 layers
-        o_proj_key = f"model.layers.{i}.self_attn.o_proj.weight"
-        if o_proj_key in weights:
-            orig_shape = weights[o_proj_key].shape
-            print(f"[DEBUG-WEIGHTS] Layer {i} o_proj original shape: {orig_shape}")
-            
-            # Transpose the weight tensor to match our model's expected shape
-            weights[o_proj_key] = weights[o_proj_key].transpose(0, 1)
-            new_shape = weights[o_proj_key].shape
-            print(f"[DEBUG-WEIGHTS] Layer {i} o_proj after transpose: {new_shape}")
+    # [CASCADE] Removed o_proj weight transposition. o_proj is now BitLinear(hidden_size, hidden_size)
+    # and expects weights accordingly (e.g., packed (hidden_size/PACK_FACTOR, hidden_size)).
+    # The convert_from_huggingface function should provide weights in the correct format (or nearly correct, to be packed by BitLinear).
     
     print("\n[DEBUG-LOAD] Starting load_state_dict with transposed weights")
     # Check a few key weights before loading
