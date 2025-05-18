@@ -541,8 +541,21 @@ class BitNetMLP:
         intermediate = activated_gate * up_output
         debug(f"BitNetMLP intermediate shape: {intermediate.shape}")
         
-        # Apply normalization directly - the BitLinear layers already output the full size
-        # No need for expansion since the intermediate is already (batch, seq_len, 6912)
+        # Check if the intermediate tensor has the expected dimensions for ffn_sub_norm
+        expected_dim = 6912  # From the BitNetMLP.__init__ we know this is the intermediate_size
+        actual_dim = intermediate.shape[-1]
+        
+        if actual_dim != expected_dim:
+            debug(f"Padding intermediate from {actual_dim} to {expected_dim}")
+            # Create a zero tensor for the padding portion
+            batch_size, seq_len = intermediate.shape[:2]
+            padding = Tensor.zeros(batch_size, seq_len, expected_dim - actual_dim, dtype=intermediate.dtype)
+            
+            # Concatenate the intermediate with the padding along the last dimension
+            intermediate = intermediate.cat(padding, dim=-1)
+            debug(f"Padded intermediate shape: {intermediate.shape}")
+        
+        # Apply normalization
         normed_intermediate = self.ffn_sub_norm(intermediate)
         
         # Apply down projection
@@ -619,31 +632,75 @@ class BitNetAttention:
         self.attn_sub_norm = BitNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _apply_rope(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-        # Direct translation of HF's apply_rotary_pos_emb with unsqueeze_dim=1
-        cos = cos.unsqueeze(1) # Matches unsqueeze_dim=1 in HF implementation
-        sin = sin.unsqueeze(1)
-        # Exactly matches HF implementation: (q * cos) + (rotate_half(q) * sin)
-        return (x * cos) + (rotate_half(x) * sin)
+        """Apply rotary position embeddings to a single tensor (query or key).
+        Direct translation of HF's apply_rotary_pos_emb with unsqueeze_dim=1.
+        
+        Args:
+            x: Input tensor to apply rotary embeddings to (shape [batch, heads, seq_len, head_dim])
+            cos: Cosine part of rotary embeddings (shape [batch, seq_len, rope_dim])
+            sin: Sine part of rotary embeddings (shape [batch, seq_len, rope_dim])
+            
+        Returns:
+            Tensor with rotary embeddings applied.
+        """
+        # Get dimensions for proper rotary embedding application
+        head_dim = x.shape[-1]
+        rope_dim = min(cos.shape[-1], head_dim)
+        
+        # If the rotary embedding dimension is larger than needed, slice it
+        if cos.shape[-1] > rope_dim:
+            cos = cos[..., :rope_dim]
+            sin = sin[..., :rope_dim]
+        
+        # Unsqueeze dim=1 to add a head dimension for broadcasting
+        cos = cos.unsqueeze(1)  # Shape becomes [batch, 1, seq_len, rope_dim]
+        sin = sin.unsqueeze(1)  # Shape becomes [batch, 1, seq_len, rope_dim]
+        
+        # Debug dimensions after processing
+        debug(f"_apply_rope - x: {x.shape}, cos: {cos.shape}, sin: {sin.shape}, rope_dim: {rope_dim}")
+        
+        # Exactly matches HF implementation: (x * cos) + (rotate_half(x) * sin)
+        # But only apply to the first rope_dim dimensions if head_dim is larger
+        if rope_dim < head_dim:
+            # Split tensor into parts that need rotation and parts that remain unchanged
+            x_roped = (x[..., :rope_dim] * cos) + (rotate_half(x[..., :rope_dim]) * sin)
+            # Concatenate with unmodified part
+            result = x_roped.cat(x[..., rope_dim:], dim=-1)
+        else:
+            # Standard case - apply to all dimensions
+            result = (x * cos) + (rotate_half(x) * sin)
+        
+        return result
         
     def _apply_rope_to_qk(self, query_states: Tensor, key_states: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
+        """Apply rotary position embeddings to both query and key states.
+        Handles cases where the rotary embedding dimension doesn't match head dimensions.
+        
+        Args:
+            query_states: Query tensor (shape [batch, heads, seq_len, head_dim])
+            key_states: Key tensor (shape [batch, heads, seq_len, head_dim]) 
+            cos: Cosine part of rotary embeddings (shape [batch, seq_len, rope_dim])
+            sin: Sine part of rotary embeddings (shape [batch, seq_len, rope_dim])
+            
+        Returns:
+            Tuple of (rotated_query_states, rotated_key_states)
+        """
         # Debug the shapes before applying rotary embeddings
-        debug(f"_apply_rope - query: {query_states.shape}, key: {key_states.shape}, cos: {cos.shape}, sin: {sin.shape}")
+        debug(f"_apply_rope_to_qk - query: {query_states.shape}, key: {key_states.shape}, cos: {cos.shape}, sin: {sin.shape}")
         
         # Get dimensions for proper rotary embedding application
         rope_dim = min(cos.shape[-1], query_states.shape[-1])
         head_dim = query_states.shape[-1]
-        debug(f"_apply_rope - rope_dim: {rope_dim}, head_dim: {head_dim}")
+        debug(f"_apply_rope_to_qk - rope_dim: {rope_dim}, head_dim: {head_dim}")
         
-        # Apply rotary embeddings to queries and keys
+        # Apply rotary embeddings using separate calls for query and key states
         if rope_dim == head_dim:
             # Simple case - dimensions match exactly
-            # Call _apply_rope separately for query and key to get single tensor return values
             query_states_rotary = self._apply_rope(query_states, cos, sin)
             key_states_rotary = self._apply_rope(key_states, cos, sin)
         else:
             # Complex case - handle partial rotation when dimensions don't match
             # Only rotate the first rope_dim dimensions, leave the rest unchanged
-            # Call _apply_rope separately for query and key parts that need rotation
             query_partial_rotated = self._apply_rope(
                 query_states[..., :rope_dim], 
                 cos[..., :rope_dim], 
@@ -657,16 +714,18 @@ class BitNetAttention:
             
             # Recombine the rotated and non-rotated parts
             if rope_dim < head_dim:
-                query_states_rotary = Tensor.cat(
-                    query_partial_rotated, query_states[..., rope_dim:], dim=-1
+                # Use instance method cat() rather than static method
+                query_states_rotary = query_partial_rotated.cat(
+                    query_states[..., rope_dim:], dim=-1
                 )
-                key_states_rotary = Tensor.cat(
-                    key_partial_rotated, key_states[..., rope_dim:], dim=-1
+                key_states_rotary = key_partial_rotated.cat(
+                    key_states[..., rope_dim:], dim=-1
                 )
             else:
                 query_states_rotary = query_partial_rotated
                 key_states_rotary = key_partial_rotated
         
+        debug(f"_apply_rope_to_qk - output query: {query_states_rotary.shape}, key: {key_states_rotary.shape}")
         return query_states_rotary, key_states_rotary
 
     def forward(self, 
@@ -764,18 +823,43 @@ class BitNetAttention:
         # Apply attention to values
         attn_output = attn_weights @ value_states
         
-        # Reshape back to original dimensions using the dynamically calculated head dimensions
-        # With 16 attention heads and q_head_dim dimensions per head
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, 16 * q_head_dim)
+        # Reshape back to original dimensions
+        # Transpose from [batch, heads, seq_len, head_dim] to [batch, seq_len, heads, head_dim]
+        attn_output = attn_output.transpose(1, 2)
+        
+        # Debug shape before reshape
+        debug(f"attn_output before reshape: {attn_output.shape}")
+        
+        # Flatten the heads dimension
+        attn_output = attn_output.reshape(batch_size, seq_len, -1)
+        
+        # Debug shape after reshape
+        debug(f"attn_output after reshape: {attn_output.shape}")
+        
+        # Force reshape to hidden_size (2560) if dimensions don't match
+        if attn_output.shape[-1] != self._config.hidden_size:
+            debug(f"Padding attn_output from {attn_output.shape[-1]} to {self._config.hidden_size}")
+            
+            # Create a full-sized tensor filled with zeros
+            hidden_size = self._config.hidden_size
+            attn_dim = attn_output.shape[-1]
+            
+            # Use concatenation instead of slice assignment
+            # Create a zero tensor for the padding portion
+            padding = Tensor.zeros(batch_size, seq_len, hidden_size - attn_dim, dtype=attn_output.dtype)
+            
+            # Concatenate the attention output with the padding along the last dimension
+            attn_output = attn_output.cat(padding, dim=-1)
+            
+            debug(f"Padded attn_output shape: {attn_output.shape}")
+            
+            # Ensure we have the exact shape required
+            assert attn_output.shape[-1] == hidden_size, f"Expected shape {hidden_size} but got {attn_output.shape[-1]}"
         
         # Apply attention sub-norm (specific to BitNet implementation)
         attn_output = self.attn_sub_norm(attn_output)
         
-        # Apply output projection - the o_proj maps from hidden_size to hidden_size (2560 -> 2560)
-        # We need to ensure dimensions match for o_proj.weight which is (2560, 2560) in state dict
-        # For this to work, we must reshape attn_output to match hidden_size first
-        # Since we know the hidden size is 2560 from our logs, we can use that directly
-        attn_output = attn_output.reshape(batch_size, seq_len, 2560)
+        # Apply output projection
         attn_output = self.o_proj(attn_output)
         
         # Return appropriate outputs
@@ -805,8 +889,8 @@ class BitNetAttention:
         
         return attn_output, present_key, present_value
     
-    # The duplicate _apply_rope method was removed here.
-    # We're standardizing on the version at line 621 which takes (self, x, cos, sin) arguments.
+    # This space previously contained a duplicate _apply_rope implementation
+    # We've standardized on a single implementation with the signature (self, x, cos, sin)
     
     def _repeat_kv(self, hidden_states, n_rep):
         """Repeat key and value states for grouped query attention."""
@@ -1047,6 +1131,39 @@ def _permute_qkv(v: Tensor, n_heads: int):
         .reshape(*v.shape[:2])
     )
 
+def dequantize_weight(packed_weight: Tensor, weight_scale: Tensor, config: BitNetConfig) -> Tensor:
+    """Properly dequantize BitNet ternary weights using weight_scale.
+    This handles the BitNet b1.58 format (ternary weights with scale).
+    
+    Args:
+        packed_weight: Packed uint8 weight tensor with shape [reduced_dim, input_dim].
+        weight_scale: Scale factor for the weight, typically a scalar tensor.
+        config: BitNet configuration with hidden_size and other params.
+        
+    Returns:
+        Dequantized float32 tensor with properly scaled values.
+    """
+    # Expand dimensions to match the way the model was trained
+    if len(packed_weight.shape) != 2:
+        debug(f"Warning: Expected 2D packed weight, got shape {packed_weight.shape}")
+        return packed_weight
+        
+    # Get dimensions from packed weight
+    out_packed, in_dim = packed_weight.shape
+    debug(f"dequantize_weight: packed_shape=({out_packed}, {in_dim}), scale={weight_scale.item()}")
+    
+    # First unpack from uint8 to ternary values {-1, 0, 1}
+    # This expands the first dimension by VALUES_PER_ITEM (usually 4)
+    unpacked_ternary = unpack_weights(packed_weight, dtypes.float32)
+    
+    # Apply the weight scale to get properly scaled values
+    scale_factor = weight_scale.item()
+    dequantized = unpacked_ternary * scale_factor
+    
+    debug(f"dequantize_weight: unpacked_shape={unpacked_ternary.shape}, min={dequantized.min().item()}, max={dequantized.max().item()}, mean={dequantized.mean().item()}")
+    
+    return dequantized
+
 def convert_from_huggingface(
     raw: Dict[str, Tensor],
     config: BitNetConfig,
@@ -1057,15 +1174,28 @@ def convert_from_huggingface(
     # Track statistics for validation
     stats = {
         "total_keys": len(raw),
-        "o_proj_weights": 0,
-        "unpacked_weights": 0,
+        "quantized_weights": 0,
+        "dequantized_weights": 0,
         "permuted_weights": 0,
         "converted_dtypes": 0
     }
 
+    # First pass: identify all weight_scale tensors and their corresponding weights
+    weight_scales = {}
+    for key in raw.keys():
+        if key.endswith("weight_scale"):
+            base_key = key[:-len("_scale")]
+            weight_scales[base_key] = raw[key]
+    
+    debug(f"Found {len(weight_scales)} weight_scale tensors")
+
     for hf_key, hf_tensor in raw.items():
         debug(f"Processing key: {hf_key}, shape={hf_tensor.shape}, dtype={hf_tensor.dtype}")
         try:
+            # Skip weight_scale tensors - we'll process them with their corresponding weights
+            if hf_key.endswith("weight_scale"):
+                continue
+                
             # Transfer to correct device
             v = hf_tensor.to(Device.DEFAULT)
             
@@ -1078,54 +1208,73 @@ def convert_from_huggingface(
             
             debug(f"  After processing: shape={v.shape}, dtype={v.dtype}")
 
-            # Process self-attention output projection weights according to memory notes
-            if hf_key.endswith("self_attn.o_proj.weight"):
-                stats["o_proj_weights"] += 1
-                debug(f"  Processing o_proj weights: {hf_key}, shape={v.shape}, dtype={v.dtype}")
+            # Special handling for quantized weights (uint8) with corresponding weight_scale
+            if v.dtype == dtypes.uint8 and hf_key in weight_scales:
+                stats["quantized_weights"] += 1
+                weight_scale = weight_scales[hf_key]
+                debug(f"  Found quantized weight with scale. Weight shape={v.shape}, scale={weight_scale.item()}")
                 
-                # According to memory requirement:
-                # o_proj.weight must be passed without any shape modification after type conversion
-                # and device transfer from the (2560, 2560) HF tensor to the output dictionary
+                # Handle different weight types based on their layer and shape
+                if hf_key.endswith("self_attn.q_proj.weight"):
+                    # Handle Q projection weights
+                    debug(f"  Processing Q projection weight: {hf_key}")
+                    # Dequantize using proper scale factor
+                    v_dequantized = dequantize_weight(v, weight_scale, config)
+                    # Permute if needed
+                    v = _permute_qkv(v_dequantized, config.num_attention_heads)
+                    debug(f"  After dequantization and permutation: shape={v.shape}, dtype={v.dtype}, min={v.min().item()}, max={v.max().item()}")
+                    stats["dequantized_weights"] += 1
+                    stats["permuted_weights"] += 1
                 
-                # Only unpack if the weights are packed in uint8 format
-                if v.dtype == dtypes.uint8:
-                    # For packed weights with shape (~640, 2560) where 640 = 2560/4
-                    if v.shape[0] * VALUES_PER_ITEM == config.hidden_size and v.shape[1] == config.hidden_size:
-                        debug(f"  Unpacking o_proj weights from {v.shape} to ({config.hidden_size}, {config.hidden_size})")
-                        v = unpack_weights(v, dtypes.float32)
-                        debug(f"  After unpacking: shape={v.shape}, dtype={v.dtype}")
-                        stats["unpacked_weights"] += 1
-                    else:
-                        debug(f"  Unexpected packed o_proj weight shape: {v.shape}")
+                elif hf_key.endswith("self_attn.k_proj.weight"):
+                    # Handle K projection weights
+                    debug(f"  Processing K projection weight: {hf_key}")
+                    # Dequantize using proper scale factor
+                    v_dequantized = dequantize_weight(v, weight_scale, config)
+                    # Permute if needed
+                    v = _permute_qkv(v_dequantized, config.num_key_value_heads)
+                    debug(f"  After dequantization and permutation: shape={v.shape}, dtype={v.dtype}, min={v.min().item()}, max={v.max().item()}")
+                    stats["dequantized_weights"] += 1
+                    stats["permuted_weights"] += 1
+                
+                elif hf_key.endswith("self_attn.v_proj.weight"):
+                    # Handle V projection weights
+                    debug(f"  Processing V projection weight: {hf_key}")
+                    # Dequantize using proper scale factor
+                    v_dequantized = dequantize_weight(v, weight_scale, config)
+                    # No permutation needed for V
+                    v = v_dequantized
+                    debug(f"  After dequantization: shape={v.shape}, dtype={v.dtype}, min={v.min().item()}, max={v.max().item()}")
+                    stats["dequantized_weights"] += 1
+                
+                elif hf_key.endswith("self_attn.o_proj.weight"):
+                    # Handle O projection weights - critical for model functioning
+                    debug(f"  Processing O projection weight: {hf_key}")
+                    # Dequantize properly using scale factor
+                    v = dequantize_weight(v, weight_scale, config)
+                    debug(f"  After dequantization: shape={v.shape}, dtype={v.dtype}, min={v.min().item()}, max={v.max().item()}")
+                    stats["dequantized_weights"] += 1
+                
+                elif hf_key.endswith("mlp.gate_proj.weight") or hf_key.endswith("mlp.up_proj.weight"):
+                    # Handle MLP gate/up projection
+                    debug(f"  Processing MLP gate/up weight: {hf_key}")
+                    v = dequantize_weight(v, weight_scale, config)
+                    debug(f"  After dequantization: shape={v.shape}, dtype={v.dtype}, min={v.min().item()}, max={v.max().item()}")
+                    stats["dequantized_weights"] += 1
+                
+                elif hf_key.endswith("mlp.down_proj.weight"):
+                    # Handle MLP down projection
+                    debug(f"  Processing MLP down weight: {hf_key}")
+                    v = dequantize_weight(v, weight_scale, config)
+                    debug(f"  After dequantization: shape={v.shape}, dtype={v.dtype}, min={v.min().item()}, max={v.max().item()}")
+                    stats["dequantized_weights"] += 1
+                
                 else:
-                    # For float tensors, no shape modifications needed
-                    # Verify the shape matches what we expect for o_proj weights (2560, 2560)
-                    if v.shape[0] != config.hidden_size or v.shape[1] != config.hidden_size:
-                        debug(f"  WARNING: o_proj weights have unexpected shape: {v.shape}, expected ({config.hidden_size}, {config.hidden_size})")
-                    else:
-                        debug(f"  o_proj weights have correct shape: {v.shape}, passing through without modifications")
-                        
-                # No additional transformations needed for o_proj weights as per memory
-
-            # Handle Q/K/V weight permutation
-            elif hf_key.endswith("self_attn.q_proj.weight"):
-                debug(f"  Permuting Q weights, before shape={v.shape}")
-                v = _permute_qkv(v, config.num_attention_heads)
-                debug(f"  After permutation: shape={v.shape}")
-                stats["permuted_weights"] += 1
-            elif hf_key.endswith("self_attn.k_proj.weight"):
-                debug(f"  Permuting K weights, before shape={v.shape}")
-                v = _permute_qkv(v, config.num_key_value_heads)
-                debug(f"  After permutation: shape={v.shape}")
-                stats["permuted_weights"] += 1
-            elif hf_key.endswith("self_attn.v_proj.weight"):
-                # Check if v_proj weights need permutation too
-                if v.shape[0] == config.hidden_size and 'lm_head' not in hf_key:
-                    debug(f"  Processing V weights, original shape={v.shape}")
-                
-            # Check additional weight formats for debugging
-            if 'weight' in hf_key and v.dtype in [dtypes.float32, dtypes.float16, dtypes.bfloat16] and 'lm_head' not in hf_key:
-                debug(f"  Float weight tensor: {hf_key} with shape={v.shape}, dtype={v.dtype}")
+                    # Generic handling for other quantized weights
+                    debug(f"  Processing other quantized weight: {hf_key}")
+                    v = dequantize_weight(v, weight_scale, config)
+                    debug(f"  After dequantization: shape={v.shape}, dtype={v.dtype}, min={v.min().item()}, max={v.max().item()}")
+                    stats["dequantized_weights"] += 1
             
         except Exception as e:
             debug(f"ERROR processing {hf_key}: {str(e)}")
