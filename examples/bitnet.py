@@ -65,12 +65,12 @@ def load(fn:str):
     return torch_load(fn)
 
 
-# default settings
-TEMPERATURE = 0.0
-TOP_K       = 1
-TOP_P       = 1.0
-ALPHA_F     = 0.0
-ALPHA_P     = 0.0
+# default settings - adjusted for better diversity
+TEMPERATURE = 0.8  # Increased from 0.0 to introduce diversity
+TOP_K       = 40   # Increased from 1 to consider more tokens
+TOP_P       = 0.95 # Using nucleus sampling to filter unlikely tokens
+ALPHA_F     = 0.0  # Frequency penalty (unchanged)
+ALPHA_P     = 0.0  # Presence penalty (unchanged)
 
 
 last_seen_toks = []
@@ -407,7 +407,7 @@ if __name__ == "__main__":
       print(f"[CHAT] Encoded user message tokens: {toks}")
       print(f"[CHAT] Encoded text: '{tokenizer.decode(toks)}'")
 
-      print("[CHAT] Starting prefill with user message...")
+      print("[CHAT] Starting prefill with user message...") 
       kv_cache = prefill(model, toks[:-1], kv_cache)      # Pass and receive kv_cache
       last_tok = toks[-1]
       seq_pos = len(toks) - 1                  # Numeric cursor
