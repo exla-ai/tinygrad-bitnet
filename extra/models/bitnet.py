@@ -439,7 +439,13 @@ class BitLinear:
             debug(f"BitLinear.__call__: USING ON-THE-FLY TERNARY QUANTIZATION for float weights")
             
             # Break this into steps to avoid complex computation graph
-            scaled_weights = (self.weight / self.weight_scale).realize()
+            # Dynamically calculate weight_scale (beta = E[|W|])
+            # Add a small epsilon to prevent division by zero if weights are all zero
+            current_dynamic_weight_scale = self.weight.abs().mean().realize() + 1e-7 
+            debug(f"BitLinear.__call__: dynamic_weight_scale={current_dynamic_weight_scale.item()}")
+            
+            # Ternarize weights using the dynamic scale
+            scaled_weights = (self.weight / current_dynamic_weight_scale).realize()
             rounded_weights = scaled_weights.round().realize()
             w_ternary = rounded_weights.clamp(-1, 1).realize()
             
@@ -455,7 +461,7 @@ class BitLinear:
         out_div_scale = (out_raw / x_scale).realize()
         
         # Then divide by weight scale
-        out = (out_div_scale / self.weight_scale).realize()
+        out = (out_div_scale * current_dynamic_weight_scale).realize()
         
         debug(f"BitLinear.__call__: after dequant, out.shape={out.shape}, out.min={out.min().item() if out.numel() > 0 else 'N/A'}, out.max={out.max().item() if out.numel() > 0 else 'N/A'}")
         
