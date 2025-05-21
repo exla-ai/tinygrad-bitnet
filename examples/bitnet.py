@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import List
 import json, argparse, random, time, os
+import tinygrad; tinygrad.DEBUG = 2
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 from extra.models.bitnet import BitNetConfig, BitNetForCausalLM, convert_from_huggingface, build_transformer, debug
