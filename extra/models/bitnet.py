@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import sys
+import re
 
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.nn import Embedding, Linear  # Linear only for lm_head
@@ -53,85 +54,74 @@ class WeightQuant:
 # 2‑bit weight pack / unpack helpers
 # ────────────────────────────────────────────────────────────
 
-def unpack_weights(arr: np.ndarray, weight_scale: float, dtype=dtypes.int8) -> Tensor:
-    """Unpacks 2-bit weights (packed into uint8) into ternary {-1, 0, 1} float32/float16 tensor.
-    Handles chunking for very large tensors to avoid Metal buffer limits.
+def unpack_ternary_weights(arr: np.ndarray, target_dtype=dtypes.float32) -> Tensor:
+    """Unpacks 2-bit weights (packed into uint8) into ternary {-1, 0, 1} tensor of target_dtype.
+    The returned tensor is NOT scaled by weight_scale here.
     Args:
-        packed: uint8 Tensor with shape [out_features//4, in_features]
-        target_dtype: The desired dtype for the output tensor (e.g., dtypes.float32)
+        arr: uint8 NumPy array with shape [out_features_packed, in_features]
+        target_dtype: The desired tinygrad dtype for the output tensor (e.g., dtypes.float32, dtypes.bfloat16).
     Returns:
-        Tensor with shape [out_features, in_features] and dtype=target_dtype.
+        Tensor with shape [out_features_unpacked, in_features] and dtype=target_dtype, values are {-1, 0, 1}.
     """
-    debug(f"unpack_weights: packed.shape={arr.shape}, packed.dtype={arr.dtype}, target_dtype={dtype}")
-    VALUES_PER_ITEM = 4  # Number of 2-bit values packed into one uint8
+    debug(f"unpack_ternary_weights: packed_np.shape={arr.shape}, packed_np.dtype={arr.dtype}, target_dtype={target_dtype}")
+    VALUES_PER_ITEM = 4
     out_shape = (arr.shape[0] * VALUES_PER_ITEM, arr.shape[1])
     result: Tensor
 
-    # Determine if chunking is needed (based on output rows, e.g., out_features)
-    # Heuristic: if out_features > 8192 (e.g., 8192*6912 matrix), chunk it.
-    # This corresponds to packed.shape[0] > 2048
-    # Metal buffer limit is often around 256MB-1GB. A 8192x6912 float32 is ~220MB.
-    # Let's use a more conservative limit for packed.shape[0] to be safe.
-    CHUNK_THRESHOLD_PACKED_ROWS = getenv("UNPACK_CHUNK_ROWS", 1024) # tunable via env var
+    CHUNK_THRESHOLD_PACKED_ROWS = getenv("UNPACK_CHUNK_ROWS", 1024)
 
     if arr.shape[0] > CHUNK_THRESHOLD_PACKED_ROWS:
-        debug(f"unpack_weights: Using CHUNKED unpacking. packed_rows={arr.shape[0]} > threshold={CHUNK_THRESHOLD_PACKED_ROWS}")
+        debug(f"unpack_ternary_weights: Using CHUNKED unpacking. packed_rows={arr.shape[0]} > threshold={CHUNK_THRESHOLD_PACKED_ROWS}")
         num_chunks = (arr.shape[0] + CHUNK_THRESHOLD_PACKED_ROWS - 1) // CHUNK_THRESHOLD_PACKED_ROWS
-        debug(f"unpack_weights: Splitting into {num_chunks} chunks of size ~{CHUNK_THRESHOLD_PACKED_ROWS} packed rows")
         result_chunks = []
-
         for i in range(num_chunks):
             start_row = i * CHUNK_THRESHOLD_PACKED_ROWS
             end_row = min((i + 1) * CHUNK_THRESHOLD_PACKED_ROWS, arr.shape[0])
-            packed_chunk_np = arr[start_row:end_row] # Get NumPy chunk from Tensor
+            packed_chunk_np = arr[start_row:end_row]
             
-            # Unpack bits for this chunk using NumPy
             chunk_out_dim = packed_chunk_np.shape[0] * VALUES_PER_ITEM
             unpacked_chunk_np = np.empty((chunk_out_dim, packed_chunk_np.shape[1]), dtype=np.uint8)
-
             unpacked_chunk_np[0::VALUES_PER_ITEM, :] = (packed_chunk_np >> 0) & 3
             unpacked_chunk_np[1::VALUES_PER_ITEM, :] = (packed_chunk_np >> 2) & 3
             unpacked_chunk_np[2::VALUES_PER_ITEM, :] = (packed_chunk_np >> 4) & 3
             unpacked_chunk_np[3::VALUES_PER_ITEM, :] = (packed_chunk_np >> 6) & 3
             
-            # Convert to ternary values {-1, 0, 1} using NumPy
-            intermediate_np_values = unpacked_chunk_np.astype("f4") - 1.0 # float32 with {-1,0,1,2}
+            intermediate_np_values = unpacked_chunk_np.astype("f4") - 1.0
             clamped_np_values = np.clip(intermediate_np_values, -1.0, 1.0) # float32 with {-1,0,1}
             
-            # Create Tensor for this chunk and realize
-            chunk_tensor = Tensor(
-                clamped_np_values * weight_scale,
-                dtype=dtype, # CRITICAL: Use target_dtype
+            # Create tensor from {-1,0,1} float32 numpy data, then cast to target_dtype
+            temp_float32_tensor = Tensor(
+                clamped_np_values, 
+                dtype=dtypes.float32,
                 requires_grad=False,
                 device=Device.DEFAULT
-            ).realize()
+            )
+            chunk_tensor = temp_float32_tensor.cast(target_dtype).realize()
             result_chunks.append(chunk_tensor)
-            debug(f"unpack_weights: Processed chunk {i+1}/{num_chunks}, chunk_tensor.shape={chunk_tensor.shape}")
-            
-        result = Tensor.cat(*result_chunks, dim=0).contiguous() if result_chunks else Tensor([], shape=(0, *out_shape[1:]), dtype=dtype)
+        result = Tensor.cat(*result_chunks, dim=0).contiguous() if result_chunks else Tensor([], shape=(0, *out_shape[1:]), dtype=target_dtype)
     else:
-        debug(f"unpack_weights: Using NON-CHUNKED unpacking for shape {arr.shape}")
-        packed_np = arr # Move to CPU and get NumPy array
-        
+        debug(f"unpack_ternary_weights: Using NON-CHUNKED unpacking for shape {arr.shape}")
+        packed_np = arr
         unpacked_np = np.empty(out_shape, dtype=np.uint8)
         unpacked_np[0::VALUES_PER_ITEM, :] = (packed_np >> 0) & 3
         unpacked_np[1::VALUES_PER_ITEM, :] = (packed_np >> 2) & 3
         unpacked_np[2::VALUES_PER_ITEM, :] = (packed_np >> 4) & 3
         unpacked_np[3::VALUES_PER_ITEM, :] = (packed_np >> 6) & 3
         
-        intermediate_np_values = unpacked_np.astype("f4") - 1.0 # float32 with {-1,0,1,2}
+        intermediate_np_values = unpacked_np.astype("f4") - 1.0
         clamped_np_values = np.clip(intermediate_np_values, -1.0, 1.0) # float32 with {-1,0,1}
         
-        result = Tensor(
-            clamped_np_values * weight_scale,
-            dtype=dtype, # CRITICAL: Use target_dtype
+        temp_float32_tensor = Tensor(
+            clamped_np_values, # float32 numpy data
+            dtype=dtypes.float32,
             requires_grad=False,
             device=Device.DEFAULT 
-        ).realize()
+        )
+        result = temp_float32_tensor.cast(target_dtype).realize()
     
-    debug(f"unpack_weights: final result shape={result.shape}, dtype={result.dtype}, min={result.min().item() if result.numel() > 0 else 'N/A'}, max={result.max().item() if result.numel() > 0 else 'N/A'}")
+    debug(f"unpack_ternary_weights: final result shape={result.shape}, dtype={result.dtype}, min={result.min().item() if result.numel() > 0 else 'N/A'}, max={result.max().item() if result.numel() > 0 else 'N/A'}")
     assert result.shape == out_shape, f"Shape mismatch: expected {out_shape}, got {result.shape}"
-    assert result.dtype == dtype, f"Dtype mismatch: expected {dtype}, got {result.dtype}"
+    assert result.dtype == target_dtype, f"Dtype mismatch: expected {target_dtype}, got {result.dtype}"
     return result
 
 
@@ -254,28 +244,47 @@ class BitLinear:
         self.device = device or Device.DEFAULT
         self.transposed = transposed
 
-        # Always use uint8 for weights to enable bit manipulation in unpack_weights
+        # self.weight is initialized on self.device (e.g., CUDA) and will be int8.
+        # It will be filled by load_state_dict with data that originates from CPU uchar,
+        # then transferred to self.device and cast to int8 (lazily if realize=False in load_state_dict).
         if transposed:
-            # If transposed, the weights have dimensions reversed compared to normal linear layer
             self.weight = Tensor.empty(
-                (in_features, out_features), dtype=dtypes.uint8, requires_grad=False, device=self.device
+                (in_features, out_features), dtype=dtypes.int8, requires_grad=False, device=self.device
             )
         else:
             self.weight = Tensor.empty(
-                (out_features, in_features), dtype=dtypes.uint8, requires_grad=False, device=self.device
+                (self.out_features // VALUES_PER_ITEM, self.in_features), dtype=dtypes.int8, requires_grad=False, device=self.device
             )
         
-        self.weight_scale = Tensor([1.0], dtype=dtype, requires_grad=False, device=self.device)
+        # self.weight_scale is always a CPU float32 tensor.
+        # It's loaded from a CPU float32 tensor from the weights dict.
+        self.weight_scale = Tensor([1.0], dtype=dtypes.float32, requires_grad=False, device="CPU")
 
     def __call__(self, x: Tensor) -> Tensor:
-        sign = unpack_weights(self.weight.numpy(), self.weight_scale[0], x.dtype)
-        w_f32 = sign * self.weight_scale[0]
+        # self.weight needs to be on CPU for .numpy().
+        # It was initialized on self.device (e.g. CUDA) and load_state_dict (with realize=False)
+        # set up a lazy load (transfer from CPU & cast from uchar to int8).
+        # .to('CPU').realize() ensures these ops complete and data is on CPU.
+        packed_weights_np = self.weight.to('CPU').realize().numpy()
+
+        # unpack_ternary_weights returns a tinygrad Tensor on Device.DEFAULT (e.g. CUDA),
+        # with self.dtype, containing {-1, 0, 1} values.
+        # self.dtype is the computation dtype for this layer (e.g. bfloat16 or float32).
+        dequantized_ternary_weights = unpack_ternary_weights(packed_weights_np, self.dtype)
         
         if self.transposed:
-            # For transposed weights, we don't transpose again during the forward pass
-            out = x @ w_f32
+            # For transposed weights, x @ W
+            # x: (..., in_features), dequantized_ternary_weights: (in_features, out_features)
+            out = x @ dequantized_ternary_weights
         else:
-            out = x @ w_f32.T
+            # For non-transposed weights, x @ W.T
+            # x: (..., in_features), dequantized_ternary_weights: (out_features, in_features)
+            out = x @ dequantized_ternary_weights.T
+        
+        # Apply scaling factor as a tensor operation.
+        # self.weight_scale is CPU float32. .to(out.device) moves and casts it to out's device and dtype.
+        # This operation will be part of the graph and realized with the matmul.
+        out = out * self.weight_scale.to(out.device) 
             
         return out
 
@@ -313,46 +322,35 @@ class BitNetMLP:
         
         The activation pattern is SwiGLU-like: (gate_proj * relu^2(up_proj))
         """
-        # Use dimensions that match the pretrained weights
-        hidden_size = config.hidden_size  # 2560
+        hidden_size = config.hidden_size         # 2560
+        intermediate_size = config.intermediate_size # 6912
         
-        # IMPORTANT: Use the correct intermediate sizes
-        # For our ffn_ln weight normalization, we need size 1728
-        self.inter_dim = 1728
+        self.gate_proj = BitLinear(hidden_size, intermediate_size, device=device)
+        self.up_proj = BitLinear(hidden_size, intermediate_size, device=device)
         
-        # For the projection layers, we need to match the state dictionary dimensions
-        self.gate_proj = BitLinear(hidden_size, self.inter_dim, device=device)   # (2560, 1728)
-        self.up_proj = BitLinear(hidden_size, self.inter_dim, device=device)     # (2560, 1728)
+        # Layer normalization is applied to the intermediate_size features
+        self.ffn_ln = BitNetRMSNorm(intermediate_size, eps=config.rms_norm_eps, device=device)
         
-        # Use layer normalization with inter_dim (1728)
-        self.ffn_ln = BitNetRMSNorm(self.inter_dim, eps=config.rms_norm_eps, device=device)
-        
-        # The down_proj weights in the state dict have shape (640, 6912)
-        self.down_proj = BitLinear(640, 6912, transposed=True, device=device)
+        # down_proj: intermediate_size (6912) -> hidden_size (2560)
+        # Weight shape from file is (640, 6912) uchar.
+        # If not transposed, BitLinear(6912, 2560) expects weight (2560//4, 6912) = (640, 6912). This matches.
+        self.down_proj = BitLinear(intermediate_size, hidden_size, transposed=False, device=device)
 
     def __call__(self, x: Tensor) -> Tensor:
-        # Get initial batch dimensions
-        batch_size, seq_len = x.shape[0], x.shape[1]
+        # x shape: (batch, seq_len, hidden_size)
         
-        # Apply gate projection and activation
-        gate = self.gate_proj(x)          # Shape: (batch, seq_len, inter_dim)
-        gate = gate.relu() ** 2          # Apply activation
+        gate = self.gate_proj(x)          # Output: (batch, seq_len, intermediate_size)
+        gate = gate.relu() ** 2
         
-        # Apply up projection
-        up = self.up_proj(x)             # Shape: (batch, seq_len, inter_dim)
+        up = self.up_proj(x)             # Output: (batch, seq_len, intermediate_size)
         
-        # Element-wise multiplication
-        h = gate * up                    # Shape: (batch, seq_len, inter_dim)
+        h = gate * up                    # Shape: (batch, seq_len, intermediate_size)
         
-        # Apply layer normalization
-        h = self.ffn_ln(h)               # Shape: (batch, seq_len, inter_dim)
+        h = self.ffn_ln(h)               # Shape: (batch, seq_len, intermediate_size)
         
-        # Reshape to match down_proj input dimension
-        # The down_proj expects input of shape (batch, seq_len, 640)
-        h_reshaped = h.reshape(batch_size, seq_len, 640, -1).sum(-1)
-        
-        # Apply down projection
-        return self.down_proj(h_reshaped)  # Final shape: (batch, seq_len, hidden_size)
+        # down_proj expects input of shape (..., intermediate_size)
+        # and outputs (..., hidden_size)
+        return self.down_proj(h)
 
 
 class BitNetRotaryEmbedding:
@@ -401,13 +399,13 @@ class BitNetAttention:
         # q_proj.weight: (640, 2560)
         # k_proj.weight/v_proj.weight: (160, 2560)
         # o_proj.weight: (640, 2560) - Unpacked from original (640, 2560)
-        self.q_proj = BitLinear(config.hidden_size, 640, device=device)
-        self.k_proj = BitLinear(config.hidden_size, 160, device=device)
-        self.v_proj = BitLinear(config.hidden_size, 160, device=device)
+        self.q_proj = BitLinear(config.hidden_size, config.num_attention_heads * self.head_dim, device=device)
+        self.k_proj = BitLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, device=device)
+        self.v_proj = BitLinear(config.hidden_size, config.num_key_value_heads * self.head_dim, device=device)
         
         # o_proj needs to match the EXACT shape of the weights in the state dict (640, 2560)
         # From the error logs, we see the state dict expects (640, 2560) for o_proj.weight
-        self.o_proj = BitLinear(config.hidden_size, 640, device=device)
+        self.o_proj = BitLinear(config.num_attention_heads * self.head_dim, config.hidden_size, device=device)
         
         # Add attention sub-normalization for stabilizing the input to the output projection
         # This matches the HF implementation exactly
@@ -944,149 +942,83 @@ def dequantize_weight(packed_weight: Tensor, weight_scale: Tensor, config: BitNe
 
 def convert_from_huggingface(raw: Dict[str, Tensor], config) -> Dict[str, Tensor]:
     """
-    Minimal converter that creates a completely new set of tensors with zeros, 
-    but sets the proper scale factors from the original weights.
-    This approach avoids device mixing issues by not trying to copy data between devices.
+    Converts weights from HuggingFace format to what the BitNet model expects.
+    - BitLinear weights are stored as packed uchar.
+    - BitLinear scales are stored as float32 tensors.
+    - Other weights (embeddings, norms) are processed as needed.
+    All tensors in the output dict will be on CPU.
     """
-    # Define helper for creating shapes based on config
-    def get_weight_shape(key_name):
-        """Get the expected shape for a weight tensor based on its name"""
-        if key_name == "model.embed_tokens.weight":
-            return (config.vocab_size, config.hidden_size)
-        if key_name == "model.norm.weight":
-            return (config.hidden_size,)
-        if key_name.endswith(".input_layernorm.weight") or \
-           key_name.endswith(".post_attention_layernorm.weight") or \
-           key_name.endswith(".self_attn.attn_sub_norm.weight"):
-            return (config.hidden_size,)
-        if key_name.endswith(".mlp.ffn_sub_norm.weight"):
-            # Use 1728 instead of config.intermediate_size (6912)
-            # This matches the actual dimension used in our BitNetMLP implementation
-            return (1728,)
-        if key_name.endswith(".mlp.gate_proj.weight") or \
-           key_name.endswith(".mlp.up_proj.weight"):
-            if config.linear_class == "autobitlinear":
-                return (config.intermediate_size // 4, config.hidden_size)
-            return (config.intermediate_size, config.hidden_size)
-        if key_name.endswith(".mlp.down_proj.weight"):
-            if config.linear_class == "autobitlinear":
-                return (config.hidden_size // 4, config.intermediate_size)
-            return (config.hidden_size, config.intermediate_size)
-        if key_name.endswith(".self_attn.q_proj.weight"):
-            if config.linear_class == "autobitlinear":
-                return (config.num_attention_heads * config.head_dim() // 4, config.hidden_size)
-            return (config.num_attention_heads * config.head_dim(), config.hidden_size)
-        if key_name.endswith(".self_attn.k_proj.weight") or \
-           key_name.endswith(".self_attn.v_proj.weight"):
-            if config.linear_class == "autobitlinear":
-                return (config.num_key_value_heads * config.head_dim() // 4, config.hidden_size)
-            return (config.num_key_value_heads * config.head_dim(), config.hidden_size)
-        if key_name.endswith(".self_attn.o_proj.weight"):
-            if config.linear_class == "autobitlinear":
-                return (config.hidden_size // 4, config.num_attention_heads * config.head_dim())
-            return (config.hidden_size, config.num_attention_heads * config.head_dim())
-        # Default case
-        return None
-    
-    target_device = Device.DEFAULT
-    print(f"[DEBUG] Creating weights on {target_device}")
-    
-    # Create dictionaries for storing our results
+    target_device = "CPU" # Prepare all weights on CPU initially
     out: Dict[str, Tensor] = {}
-    scales: Dict[str, float] = {}
-    
-    # First extract all scale factors
-    for k, v in raw.items():
+    processed_keys = set()
+
+    debug(f"[CONVERT] Starting weight conversion. Target device for 'weights' dict: {target_device}")
+
+    # Pass 1: Process and store scale tensors directly into 'out'.
+    # These are named like '...mlp.down_proj.weight_scale'.
+    for k, v_cpu in raw.items():
         if k.endswith(".weight_scale"):
-            try:
-                # Extract scale as a float value
-                if hasattr(v, "item"):
-                    # Cast to float32 before calling item() to handle bfloat16 correctly
-                    # This ensures proper handling of bfloat16 tensors
-                    base_key = k.replace(".weight_scale", "")
-                    scales[base_key] = v.cast(dtypes.float32).item()
-                else:
-                    # Fall back to string conversion (should ideally not be hit for Tensor objects)
-                    base_key = k.replace(".weight_scale", "")
-                    scales[base_key] = float(str(v).strip())
-                print(f"[DEBUG] Extracted scale for {base_key}: {scales[base_key]}")
-                sys.stdout.flush()
-            except Exception as e_scale:
-                print(f"[ERROR] Failed to extract scale for {k}: {e_scale}")
-                print(f"Tensor details: shape={v.shape}, dtype={v.dtype}, device={v.device}")
-                sys.stdout.flush()
-                base_key = k.replace(".weight_scale", "")
-                scales[base_key] = 1.0 # Default or placeholder
-    
-    # Now create output tensors
-    try:
-        for k, v_cpu in raw.items(): # v_cpu is Tensor on CPU from load_sharded
-            current_key_being_processed = k
-            if k.endswith(".weight_scale"): continue # Already processed into scales dict
-
-            print(f"[DEBUG] Processing tensor for {k} with original shape {v_cpu.shape}, dtype {v_cpu.dtype}. Target device: {target_device}")
-            sys.stdout.flush()
-
-            final_tensor: Optional[Tensor] = None
-            nk = k.replace(".weight", "")
-
-            if nk in scales and "weight" in k and not any(norm_name in k for norm_name in ["norm", "layernorm"]):
-                # This is a BitLinear weight that needs to be quantized.
-                # unpack_weights will handle moving to the device (Device.DEFAULT, which should be target_device).
-                print(f"[DEBUG] Quantizing {k} using scale {scales[nk]}")
-                sys.stdout.flush()
-                # The raw model weights (v_cpu) are usually bfloat16. unpack_weights expects a numpy array.
-                # Convert bfloat16 to float32 before calling numpy()
-                if v_cpu.dtype == dtypes.bfloat16:
-                    v_cpu = v_cpu.cast(dtypes.float32)
-                final_tensor = unpack_weights(v_cpu.numpy(), scales[nk], dtype=dtypes.int8)
-            elif "lm_head.weight" == k:
-                print(f"[DEBUG] Processing lm_head.weight {k}. Ensuring float32 on {target_device}.")
-                sys.stdout.flush()
-                temp_tensor_gpu = v_cpu.to(target_device)
-                if temp_tensor_gpu.dtype != dtypes.float32:
-                    final_tensor = temp_tensor_gpu.cast(dtypes.float32)
-                else:
-                    final_tensor = temp_tensor_gpu
+            if v_cpu.dtype == dtypes.float32:
+                scale_tensor = v_cpu.to(target_device)
             else:
-                # Regular tensor (e.g., embeddings, layernorm weights)
-                print(f"[DEBUG] Moving regular tensor {k} to {target_device}.")
-                sys.stdout.flush()
-                final_tensor = v_cpu.to(target_device)
+                # Ensure scale is a float32 tensor on the target device
+                scale_tensor = v_cpu.cast(dtypes.float32).to(target_device)
             
-            if final_tensor is not None:
-                out[k] = final_tensor
-                print(f"[DEBUG] Successfully processed tensor for {k} to {final_tensor.device}. Shape: {final_tensor.shape}, Dtype: {final_tensor.dtype}")
-                sys.stdout.flush()
+            out[k] = scale_tensor
+            processed_keys.add(k)
+            debug(f"[CONVERT] Processed scale tensor {k}. Shape: {out[k].shape}, Dtype: {out[k].dtype}, Device: {out[k].device}")
+
+    # Pass 2: Process main weight tensors.
+    for k, v_cpu in raw.items():
+        if k in processed_keys:  # Skip if already processed (e.g., it was a scale)
+            continue
+
+        # Determine if this is a BitLinear main weight by checking if its corresponding scale key exists.
+        # Example: for "model.layers.0.mlp.down_proj.weight", scale_key is "model.layers.0.mlp.down_proj.weight_scale"
+        potential_scale_key = k.replace(".weight", ".weight_scale")
+        is_bitlinear_main_weight = potential_scale_key in out # 'out' now contains all scale tensors
+
+        if is_bitlinear_main_weight:
+            # This is a main weight for a BitLinear layer (e.g., model.layers.0.mlp.down_proj.weight).
+            # It's expected to be packed uchar data from the raw HuggingFace model.
+            if v_cpu.dtype == dtypes.uchar:
+                out[k] = v_cpu.to(target_device)
             else:
-                # This case should ideally not be reached if logic is correct.
-                print(f"[ERROR] Critical: final_tensor was not set for key {k}. Skipping this tensor.")
-                sys.stdout.flush()
+                # This is a warning/fallback. Ideally, HF BitLinear weights are uchar.
+                print(f"[WARN-CONVERT] Expected uchar for BitLinear weight {k}, but got {v_cpu.dtype}. Casting to uchar.")
+                try:
+                    out[k] = v_cpu.cast(dtypes.uchar).to(target_device)
+                except Exception as e_cast:
+                    print(f"[ERROR-CONVERT] Failed to cast {k} to uchar: {e_cast}. Storing as is (dtype: {v_cpu.dtype}).")
+                    out[k] = v_cpu.to(target_device) # Store as-is if cast fails, hoping load_state_dict handles it or errors informatively
+            
+            debug(f"[CONVERT] Processed BitLinear main weight {k} (packed). Shape: {out[k].shape}, Dtype: {out[k].dtype}")
 
-    except RuntimeError as e:
-        print(f"[ERROR] RuntimeError during tensor processing for key: '{current_key_being_processed}'")
-        sys.stdout.flush()
-        if "CUDA out of memory" in str(e) or "cudaErrorMemoryAllocation" in str(e):
-            print(f"[ERROR] CUDA out of memory specific message: {e}")
+        elif "lm_head.weight" == k:
+            # lm_head is a standard Linear layer, often tied to embeddings or float32.
+            # Ensure it's float32 as per typical lm_head requirements.
+            if v_cpu.dtype == dtypes.float32:
+                 out[k] = v_cpu.to(target_device)
+            else:
+                 out[k] = v_cpu.cast(dtypes.float32).to(target_device)
+            debug(f"[CONVERT] Processed lm_head.weight {k}. Shape: {out[k].shape}, Dtype: {out[k].dtype}")
+
         else:
-            print(f"[ERROR] Non-OOM RuntimeError message: {e}")
-        print(f"Current out keys (before error on '{current_key_being_processed}'): {list(out.keys())}")
-        sys.stdout.flush()
-        # import traceback # Optional for more detailed local debugging
-        # traceback.print_exc() # Optional
-        raise # Re-raises the RuntimeError 'e'
+            # This covers other tensors like embeddings, layernorm weights, biases (if any).
+            # These are typically bfloat16 or float32 in the raw model.
+            # We move them to the target device, preserving their original dtype from raw load unless specific handling is needed.
+            # The model's layers (Embedding, BitNetRMSNorm) will handle these dtypes.
+            out[k] = v_cpu.to(target_device)
+            debug(f"[CONVERT] Processed regular tensor {k}. Shape: {out[k].shape}, Dtype: {out[k].dtype}")
+        
+        processed_keys.add(k)
 
-    except Exception as e: # Catch any other Exception
-        print(f"[ERROR] Unexpected error during tensor processing for key: '{current_key_being_processed}': {e}")
-        print(f"Type of exception: {type(e)}")
-        print(f"Current out keys (before error on '{current_key_being_processed}'): {list(out.keys())}")
-        sys.stdout.flush()
-        # import traceback # Optional for more detailed local debugging
-        # traceback.print_exc() # Optional
-        raise # Re-raises the general Exception 'e'
-    
-    # Return the processed tensors
-    print(f"[DEBUG] convert_from_huggingface: Processing {len(out)} keys")
+    # Ensure all raw keys were processed
+    if len(processed_keys) != len(raw):
+        unprocessed_raw_keys = set(raw.keys()) - processed_keys
+        print(f"[WARN-CONVERT] Some raw keys were not processed: {unprocessed_raw_keys}")
+
+    debug(f"[CONVERT] Weight conversion finished. Total keys processed: {len(out)}")
     return out
 
 # ────────────────────────────────────────────────────────────
@@ -1114,143 +1046,73 @@ def build_transformer(model_path: Path, load_weights: bool = True):
     from tinygrad.nn.state import safe_load
     debug(f"build_transformer: Loading weights from {sf_path}")
 
-    # Load weights to CPU first to avoid device mismatches
+    # Load weights to CPU first as Tensors
     raw = safe_load(str(sf_path))
     debug(f"build_transformer: Loaded {len(raw)} raw tensors from safetensors file")
     
-    # Print key shapes/dtypes for inspection
     if DEBUG_PRINT:
-        for k_debug, v_debug in list(raw.items())[:5]:  # Show first 5 for brevity
-            debug(f"  Raw tensor: {k_debug}, shape={v_debug.shape}, dtype={v_debug.dtype}")
+        for k_debug, v_debug in list(raw.items())[:5]:
+            debug(f"  Raw tensor sample: {k_debug}, shape={v_debug.shape}, dtype={v_debug.dtype}, device={v_debug.device}")
     
-    debug(f"build_transformer: Converting weights from huggingface format")
+    debug(f"build_transformer: Converting/preparing weights for the model structure.")
+    # convert_from_huggingface now prepares the 'weights' dictionary in the exact format
+    # that load_state_dict expects for the BitNetForCausalLM model.
+    # - BitLinear '.weight' will be uchar (packed).
+    # - BitLinear '.weight_scale' will be float32.
+    # - Other weights will have dtypes as per raw load or specific casting (e.g., lm_head to float32).
     weights = convert_from_huggingface(raw, config)
-    debug(f"build_transformer: Converted {len(weights)} tensors")
+    debug(f"build_transformer: Weight preparation complete. Number of tensors in 'weights' dict: {len(weights)}")
 
-    # Move all weights to the target device before loading
-    target_device = Device.DEFAULT
-    debug(f"build_transformer: Moved all weights to {target_device}")
+    # The 'weights' dictionary is now ready. The subsequent data fill/binarization loop is removed
+    # as 'convert_from_huggingface' handles the necessary transformations.
+    # load_state_dict will now map these correctly prepared tensors to the model's state_dict.
 
-    # Fill tensors with values from raw Safetensors, applying binarization for BitLinear
-    debug(f"[DEBUG-FILL] Starting data fill and binarization process for {len(raw)} raw tensors into {len(weights)} target tensors.")
-    for k_raw, v_raw in raw.items(): # raw is the original HuggingFace weights
-        if k_raw.endswith(".weight_scale"):
-            # These are already correctly processed Tensors in 'weights' dict (from convert_from_huggingface)
-            debug(f"[DEBUG-FILL] Skipping already processed scale: {k_raw}")
-            continue
-
-        if k_raw in weights: # Check if this key exists in our target 'weights' structure
-            target_tensor = weights[k_raw]
-            
-            # Determine if it's a BitLinear weight tensor based on its dtype in our 'weights' map
-            is_bitlinear_weight = target_tensor.dtype == dtypes.int8
-
-            if is_bitlinear_weight:
-                debug(f"[DEBUG-FILL] Binarizing BitLinear weight: {k_raw}, raw dtype: {v_raw.dtype} to target dtype: {target_tensor.dtype}")
-                
-                w_float32 = None
-                if v_raw.dtype == dtypes.bfloat16:
-                    w_float32 = v_raw.cast(dtypes.float32)
-                elif v_raw.dtype == dtypes.float16:
-                    w_float32 = v_raw.half().float() # Convert float16 to float32
-                elif v_raw.dtype == dtypes.float32:
-                    w_float32 = v_raw
-                else:
-                    print(f"[ERROR-FILL] Unsupported raw dtype {v_raw.dtype} for BitLinear weight {k_raw}")
-                    continue
-
-                binarized_w_float = w_float32.sign() 
-                target_tensor.assign(binarized_w_float.cast(dtypes.int8).lazydata.realize())
-                debug(f"[DEBUG-FILL]   Assigned binarized {k_raw} to weights['{k_raw}'] with dtype {target_tensor.dtype}")
-
-            else: # For non-BitLinear weights (embeddings, layernorms, biases if any) or other tensors
-                debug(f"[DEBUG-FILL] Assigning non-BitLinear/other tensor: {k_raw}, raw dtype: {v_raw.dtype}, target dtype: {target_tensor.dtype}")
-                
-                temp_tensor_val = None
-                if v_raw.dtype == dtypes.bfloat16:
-                    temp_tensor_val = v_raw.cast(target_tensor.dtype)
-                elif v_raw.dtype == dtypes.float16:
-                    if target_tensor.dtype == dtypes.float32:
-                        temp_tensor_val = v_raw.half().float().cast(target_tensor.dtype)
-                    else: 
-                        temp_tensor_val = v_raw.cast(target_tensor.dtype)
-                elif v_raw.dtype == dtypes.float32:
-                    temp_tensor_val = v_raw.cast(target_tensor.dtype)
-                else:
-                    print(f"[ERROR-FILL] Unsupported raw dtype {v_raw.dtype} for tensor {k_raw}")
-                    continue
-                
-                if temp_tensor_val is not None:
-                    if temp_tensor_val.device != target_tensor.device:
-                        # stream it from DISK (or CPU) to the same device as the destination
-                        temp_tensor_val = temp_tensor_val.to(target_tensor.device)
-                    target_tensor.assign(temp_tensor_val.realize())
-                    debug(f"[DEBUG-FILL]   Assigned {k_raw} to weights['{k_raw}'] with dtype {target_tensor.dtype}")
-        else:
-            debug(f"[WARN-FILL] Tensor {k_raw} from raw weights not found in 'weights' dict. Skipping assignment.")
-
-
-    # Use consume_prefix to strip "model." and load into net.model
-    # strict=False will report missing/unexpected keys via consume_prefix's behavior
-    debug(f"build_transformer: Loading state dict into model")
-    # Check for weight format/dtype mismatches
-    if DEBUG_PRINT:
-        # Sample a MLP gate projection weight to check if format matches
-        if "model.layers.0.mlp.gate_proj.weight" in weights:
-            debug(f"Gate projection weight dtype: {weights['model.layers.0.mlp.gate_proj.weight'].dtype}")
-            debug(f"Gate projection weight shape: {weights['model.layers.0.mlp.gate_proj.weight'].shape}")
-            gate_weight = weights['model.layers.0.mlp.gate_proj.weight'].realize()
-            debug(f"Weight stats: min={gate_weight.min().item():.6f}, max={gate_weight.max().item():.6f}, mean={gate_weight.mean().item():.6f}")
+    debug(f"build_transformer: Loading state dict into model using strict=False")
     
-    print("\n[DEBUG-LOAD] Starting load_state_dict with transposed weights")
-    # Check a few key weights before loading
-    if "model.layers.0.self_attn.o_proj.weight" in weights:
-        print(f"[DEBUG-LOAD] Layer 0 o_proj weight shape before loading: {weights['model.layers.0.self_attn.o_proj.weight'].shape}")
+    # Debug: Check a sample BitLinear weight and its scale from the `weights` dict
+    if DEBUG_PRINT and "model.layers.0.mlp.down_proj.weight" in weights:
+        debug(f"  Sample BitLinear weight PRE-LOAD: model.layers.0.mlp.down_proj.weight, shape={weights['model.layers.0.mlp.down_proj.weight'].shape}, dtype={weights['model.layers.0.mlp.down_proj.weight'].dtype}")
+        if "model.layers.0.mlp.down_proj.weight_scale" in weights:
+            debug(f"  Sample BitLinear scale PRE-LOAD: model.layers.0.mlp.down_proj.weight_scale, shape={weights['model.layers.0.mlp.down_proj.weight_scale'].shape}, dtype={weights['model.layers.0.mlp.down_proj.weight_scale'].dtype}")
     
-    # Get the expected model shape for comparison
-    model_dict = get_state_dict(net)
-    if "model.layers.0.self_attn.o_proj.weight" in model_dict:
-        print(f"[DEBUG-LOAD] Expected model shape for layer 0 o_proj: {model_dict['model.layers.0.self_attn.o_proj.weight'].shape}")
-    
+    # Get the model's state_dict structure for comparison if needed for debugging
+    model_state_dict_shapes = {k: v.shape for k, v in get_state_dict(net).items()}
+    if DEBUG_PRINT and "model.layers.0.mlp.down_proj.weight" in model_state_dict_shapes:
+        debug(f"  Model expected shape for model.layers.0.mlp.down_proj.weight: {model_state_dict_shapes['model.layers.0.mlp.down_proj.weight']}")
+
+
     try:
-        # Removed device parameter which was causing the error
-        load_state_dict(net, weights, strict=False)
-        print("[DEBUG-LOAD] State dictionary loaded successfully")
+        # Pass realize=False to defer realization until later on the proper device,
+        # preventing CPU-device tensors from requiring a renderer at load time.
+        load_state_dict(net, weights, strict=False, realize=False)  # strict=False is important
+        debug("[DEBUG-LOAD] State dictionary loaded successfully into model.")
     except Exception as e:
-        print(f"[DEBUG-LOAD] ERROR during load_state_dict: {e}")
-        # Print more details about the specific mismatch
-        if "Shape mismatch" in str(e):
-            layer_name = str(e).split("`")[1].split("\'")[0]
-            print(f"[DEBUG-LOAD] Mismatch in layer {layer_name}")
-            if layer_name in weights:
-                print(f"[DEBUG-LOAD] State dict shape: {weights[layer_name].shape}")
-            if layer_name in model_dict:
-                print(f"[DEBUG-LOAD] Model expected shape: {model_dict[layer_name].shape}")
-        raise e
-    debug(f"build_transformer: State dict loaded")
+        print(f"[ERROR-LOAD] ERROR during load_state_dict: {e}")
+        if "Shape mismatch" in str(e) or "dtype mismatch" in str(e):
+            try:
+                layer_name_match = re.search(r"layer `([^`]+)`", str(e))
+                if layer_name_match:
+                    layer_name = layer_name_match.group(1)
+                    print(f"  Mismatch details for layer: {layer_name}")
+                    if layer_name in weights:
+                        print(f"    State dict tensor: shape={weights[layer_name].shape}, dtype={weights[layer_name].dtype}")
+                    model_sd = get_state_dict(net)
+                    if layer_name in model_sd:
+                        print(f"    Model expected tensor: shape={model_sd[layer_name].shape}, dtype={model_sd[layer_name].dtype}")
+                    else:
+                        print(f"    Layer {layer_name} not found directly in model's get_state_dict(). Check nested modules.")
+                else: # Fallback parsing if the above regex fails
+                    parts = str(e).split("`")
+                    if len(parts) > 1 : layer_name = parts[1]
+                    else: layer_name = "Unknown Layer"
+                    print(f"  Mismatch in layer (fallback parsing): {layer_name}")
 
-    # Check if any layers have uint8 weights (should be quantized)
-    if DEBUG_PRINT:
-        has_uint8 = False
-        linear_count = 0
-        float_count = 0
-        # Examine BitLinear weights specifically
-        for name, module in net.__dict__.items():
-            if hasattr(module, 'weight') and hasattr(module.weight, 'dtype'):
-                dtype_str = str(module.weight.dtype)
-                debug(f"  Module weight dtype check: {name}.weight.dtype = {dtype_str}")
-                if module.weight.dtype == dtypes.uint8:
-                    has_uint8 = True
-                    linear_count += 1
-                elif module.weight.dtype in [dtypes.float32, dtypes.float16, dtypes.bfloat16]:
-                    float_count += 1
+            except Exception as e_detail:
+                print(f"    Error getting detailed mismatch info: {e_detail}")
+        import traceback
+        traceback.print_exc()
+        raise e
         
-        # Also check layers inside model
-        if hasattr(net, 'model') and hasattr(net.model, 'layers'):
-            for i, layer in enumerate(net.model.layers[:2]):  # Just check first two layers
-                debug(f"Layer {i} self_attn.q_proj weight dtype: {layer.self_attn.q_proj.weight.dtype}")
-                debug(f"Layer {i} mlp.gate_proj weight dtype: {layer.mlp.gate_proj.weight.dtype}")
-        
-        debug(f"build_transformer weight stats: uint8={linear_count}, float={float_count}, has_uint8={has_uint8}")
+    debug(f"build_transformer: State dict loaded. Model is ready.")
 
     return net, raw
