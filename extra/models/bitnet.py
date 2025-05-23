@@ -119,7 +119,7 @@ def unpack_ternary_weights(arr: np.ndarray, target_dtype=dtypes.float32) -> Tens
         )
         result = temp_float32_tensor.cast(target_dtype).realize()
     
-    debug(f"unpack_ternary_weights: final result shape={result.shape}, dtype={result.dtype}, min={result.min().item() if result.numel() > 0 else 'N/A'}, max={result.max().item() if result.numel() > 0 else 'N/A'}")
+    debug(f"unpack_ternary_weights: final result shape={result.shape}, dtype={result.dtype}, min=N/A, max=N/A")
     assert result.shape == out_shape, f"Shape mismatch: expected {out_shape}, got {result.shape}"
     assert result.dtype == target_dtype, f"Dtype mismatch: expected {target_dtype}, got {result.dtype}"
     return result
@@ -147,7 +147,7 @@ def sample(
 
     # Greedy / argmax path
     if temp < 1e-6:
-        token = int(logits.argmax().item())
+        token = int(logits.argmax().realize().to("CPU").numpy())
         print(f"[SAMPLE] Greedy sampling result: token={token}")
         return token
 
@@ -159,10 +159,10 @@ def sample(
     # mask NaNs
     logits = (logits != logits).where(-float("inf"), logits)
     probs = (logits / temp).softmax()
-    print(f"[SAMPLE] After softmax: min={probs.min().item():.6f}, max={probs.max().item():.6f}")
+    print(f"[SAMPLE] After softmax: shape={probs.shape}")
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    print(f"[SAMPLE] Top 5 probs: {probs_sort[:5].flatten().numpy().tolist() if probs_sort.shape[0] >= 5 else 'less than 5 tokens'}")
-    print(f"[SAMPLE] Top 5 indices: {probs_idx[:5].flatten().numpy().tolist() if probs_idx.shape[0] >= 5 else 'less than 5 tokens'}")
+    print(f"[SAMPLE] Top 5 probs: shape={probs_sort[:5].shape}")
+    print(f"[SAMPLE] Top 5 indices: shape={probs_idx[:5].shape}")
 
     if k:
         values, indices = probs.topk(k)
@@ -170,10 +170,23 @@ def sample(
         mask = cum >= (1 - p)
         values = values * mask
         indices = indices * mask
-        choice = int(values.multinomial().item())
-        token = int(indices[choice].item())
+        # Use CPU-based sampling instead of multinomial
+        values_np = values.realize().to("CPU").numpy()
+        indices_np = indices.realize().to("CPU").numpy()
+        # Normalize probabilities
+        if values_np.sum() > 0:
+            values_np = values_np / values_np.sum()
+            # Sample using numpy
+            choice = np.random.choice(len(values_np), p=values_np)
+        else:
+            choice = 0
+        choice = min(choice, k-1)  # Ensure choice is within bounds
+        token = int(indices_np[choice])
     else:
-        token = int(probs.multinomial().item())
+        # Use CPU-based sampling instead of multinomial
+        probs_np = probs.realize().to("CPU").numpy()
+        # Sample using numpy
+        token = int(np.random.choice(len(probs_np), p=probs_np))
 
     if af or ap:
         counter = Tensor.arange(probs.numel(), device=logits.device)
@@ -896,7 +909,7 @@ class BitNetForCausalLM:
         print(f"[MODEL-CALL] Hidden states shape: {hidden_states.shape}")
         logits = self.lm_head(hidden_states)
         debug(f"BitNetForCausalLM.__call__: logits.shape={logits.shape}")
-        print(f"[MODEL-CALL] Logits shape: {logits.shape}, min={logits.min().item():.3f}, max={logits.max().item():.3f}")
+        print(f"[MODEL-CALL] Logits shape: {logits.shape}")
         if sample_args:
             # Just return logits if no sample_args
             token = sample(logits[0, -1, :], *sample_args) # Pass 1D logits (vocab_size,) for the current token
