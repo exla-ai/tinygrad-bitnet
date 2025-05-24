@@ -55,73 +55,54 @@ class WeightQuant:
 # ────────────────────────────────────────────────────────────
 
 def unpack_ternary_weights(arr: np.ndarray, target_dtype=dtypes.float32) -> Tensor:
-    """Unpacks 2-bit weights (packed into uint8) into ternary {-1, 0, 1} tensor of target_dtype.
-    The returned tensor is NOT scaled by weight_scale here.
+    """
+    Unpacks 2-bit weights (packed into uint8) into ternary {-1, 0, 1} tensor following the transformers implementation.
+    
+    This function matches the transformers unpack_weights function exactly to ensure compatibility.
+    
     Args:
         arr: uint8 NumPy array with shape [out_features_packed, in_features]
-        target_dtype: The desired tinygrad dtype for the output tensor (e.g., dtypes.float32, dtypes.bfloat16).
+        target_dtype: The desired tinygrad dtype for the output tensor
+        
     Returns:
         Tensor with shape [out_features_unpacked, in_features] and dtype=target_dtype, values are {-1, 0, 1}.
     """
     debug(f"unpack_ternary_weights: packed_np.shape={arr.shape}, packed_np.dtype={arr.dtype}, target_dtype={target_dtype}")
-    VALUES_PER_ITEM = 4
-    out_shape = (arr.shape[0] * VALUES_PER_ITEM, arr.shape[1])
-    result: Tensor
-
-    CHUNK_THRESHOLD_PACKED_ROWS = getenv("UNPACK_CHUNK_ROWS", 1024)
-
-    if arr.shape[0] > CHUNK_THRESHOLD_PACKED_ROWS:
-        debug(f"unpack_ternary_weights: Using CHUNKED unpacking. packed_rows={arr.shape[0]} > threshold={CHUNK_THRESHOLD_PACKED_ROWS}")
-        num_chunks = (arr.shape[0] + CHUNK_THRESHOLD_PACKED_ROWS - 1) // CHUNK_THRESHOLD_PACKED_ROWS
-        result_chunks = []
-        for i in range(num_chunks):
-            start_row = i * CHUNK_THRESHOLD_PACKED_ROWS
-            end_row = min((i + 1) * CHUNK_THRESHOLD_PACKED_ROWS, arr.shape[0])
-            packed_chunk_np = arr[start_row:end_row]
-            
-            chunk_out_dim = packed_chunk_np.shape[0] * VALUES_PER_ITEM
-            unpacked_chunk_np = np.empty((chunk_out_dim, packed_chunk_np.shape[1]), dtype=np.uint8)
-            unpacked_chunk_np[0::VALUES_PER_ITEM, :] = (packed_chunk_np >> 0) & 3
-            unpacked_chunk_np[1::VALUES_PER_ITEM, :] = (packed_chunk_np >> 2) & 3
-            unpacked_chunk_np[2::VALUES_PER_ITEM, :] = (packed_chunk_np >> 4) & 3
-            unpacked_chunk_np[3::VALUES_PER_ITEM, :] = (packed_chunk_np >> 6) & 3
-            
-            intermediate_np_values = unpacked_chunk_np.astype("f4") - 1.0
-            clamped_np_values = np.clip(intermediate_np_values, -1.0, 1.0) # float32 with {-1,0,1}
-            
-            # Create tensor from {-1,0,1} float32 numpy data, then cast to target_dtype
-            temp_float32_tensor = Tensor(
-                clamped_np_values, 
-                dtype=dtypes.float32,
-                requires_grad=False,
-                device=Device.DEFAULT
-            )
-            chunk_tensor = temp_float32_tensor.cast(target_dtype).realize()
-            result_chunks.append(chunk_tensor)
-        result = Tensor.cat(*result_chunks, dim=0).contiguous() if result_chunks else Tensor([], shape=(0, *out_shape[1:]), dtype=target_dtype)
-    else:
-        debug(f"unpack_ternary_weights: Using NON-CHUNKED unpacking for shape {arr.shape}")
-        packed_np = arr
-        unpacked_np = np.empty(out_shape, dtype=np.uint8)
-        unpacked_np[0::VALUES_PER_ITEM, :] = (packed_np >> 0) & 3
-        unpacked_np[1::VALUES_PER_ITEM, :] = (packed_np >> 2) & 3
-        unpacked_np[2::VALUES_PER_ITEM, :] = (packed_np >> 4) & 3
-        unpacked_np[3::VALUES_PER_ITEM, :] = (packed_np >> 6) & 3
-        
-        intermediate_np_values = unpacked_np.astype("f4") - 1.0
-        clamped_np_values = np.clip(intermediate_np_values, -1.0, 1.0) # float32 with {-1,0,1}
-        
-        temp_float32_tensor = Tensor(
-            clamped_np_values, # float32 numpy data
-            dtype=dtypes.float32,
-            requires_grad=False,
-            device=Device.DEFAULT 
-        )
-        result = temp_float32_tensor.cast(target_dtype).realize()
     
-    debug(f"unpack_ternary_weights: final result shape={result.shape}, dtype={result.dtype}, min=N/A, max=N/A")
-    assert result.shape == out_shape, f"Shape mismatch: expected {out_shape}, got {result.shape}"
-    assert result.dtype == target_dtype, f"Dtype mismatch: expected {target_dtype}, got {result.dtype}"
+    packed_shape = arr.shape
+    if len(packed_shape) == 1:
+        original_row_dim = packed_shape[0] * VALUES_PER_ITEM
+        unpacked_shape = (original_row_dim,)
+    else:
+        original_row_dim = packed_shape[0] * VALUES_PER_ITEM
+        unpacked_shape = (original_row_dim, *packed_shape[1:])
+
+    # Initialize output array
+    unpacked = np.zeros(unpacked_shape, dtype=np.uint8)
+
+    # Unpack using the same bit manipulation as transformers
+    for i in range(VALUES_PER_ITEM):
+        start = i * packed_shape[0]
+        end = start + packed_shape[0]
+        mask = 3 << (2 * i)  # Create mask: 3 = 0b11
+        unpacked[start:end] = (arr & mask) >> (2 * i)
+
+    # Convert to target dtype and subtract 1 to get {-1, 0, 1} range
+    # This matches the transformers implementation: unpacked.to(dtype) - 1
+    result_np = unpacked.astype(np.float32) - 1.0
+    
+    # Ensure values are exactly {-1, 0, 1}
+    result_np = np.clip(result_np, -1.0, 1.0)
+    
+    # Create tensor and cast to target dtype
+    result = Tensor(result_np, dtype=dtypes.float32, requires_grad=False, device=Device.DEFAULT)
+    if target_dtype != dtypes.float32:
+        result = result.cast(target_dtype)
+    
+    result = result.realize()
+    
+    debug(f"unpack_ternary_weights: final result shape={result.shape}, dtype={result.dtype}")
+    assert result.shape == unpacked_shape, f"Shape mismatch: expected {unpacked_shape}, got {result.shape}"
     return result
 
 
@@ -273,33 +254,74 @@ class BitLinear:
         # It's loaded from a CPU float32 tensor from the weights dict.
         self.weight_scale = Tensor([1.0], dtype=dtypes.float32, requires_grad=False, device="CPU")
 
-    def __call__(self, x: Tensor) -> Tensor:
-        # self.weight needs to be on CPU for .numpy().
-        # It was initialized on self.device (e.g. CUDA) and load_state_dict (with realize=False)
-        # set up a lazy load (transfer from CPU & cast from uchar to int8).
-        # .to('CPU').realize() ensures these ops complete and data is on CPU.
-        packed_weights_np = self.weight.to('CPU').realize().numpy()
+    def activation_quant(self, x: Tensor, num_bits: int = 8) -> Tuple[Tensor, Tensor]:
+        """
+        Activation quantization: Performs symmetric, per-token quantization on the input activations.
+        Maps activations to int8 range [-128, 127] with per-token scaling.
+        
+        Args:
+            x: Input activations to be quantized
+            num_bits: Number of bits to use for quantization (default: 8)
+            
+        Returns:
+            Tuple of (quantized_activations, scale_factors)
+        """
+        Qn = -(2 ** (num_bits - 1))  # -128 for 8-bit
+        Qp = 2 ** (num_bits - 1) - 1  # 127 for 8-bit
+        
+        # Compute per-token scale factors (max absolute value along last dimension)
+        abs_max = x.abs().max(axis=-1, keepdim=True).clamp(min=1e-5)
+        scale = Qp / abs_max
+        
+        # Quantize and clamp to valid range
+        quantized = (x * scale).round().clamp(Qn, Qp)
+        
+        # Convert to int8 (represented as float in tinygrad)
+        quantized_int8 = quantized.cast(dtypes.float32)  # Tinygrad doesn't have native int8, use float32
+        
+        return quantized_int8, scale
 
-        # unpack_ternary_weights returns a tinygrad Tensor on Device.DEFAULT (e.g. CUDA),
-        # with self.dtype, containing {-1, 0, 1} values.
-        # self.dtype is the computation dtype for this layer (e.g. bfloat16 or float32).
+    def post_quant_process(self, x: Tensor, input_scale: Tensor, weight_scale: Tensor) -> Tensor:
+        """
+        Post-quantization processing: Applies proper scaling to dequantize the output.
+        
+        Args:
+            x: Output from quantized linear operation
+            input_scale: Scale factors from activation quantization
+            weight_scale: Scale factors from weight quantization
+            
+        Returns:
+            Properly scaled output tensor
+        """
+        # Combine input and weight scales
+        combined_scale = input_scale * weight_scale.to(input_scale.device)
+        
+        # Apply inverse scaling to dequantize
+        out = x / combined_scale
+        
+        return out
+
+    def __call__(self, x: Tensor) -> Tensor:
+        # Step 1: Unpack ternary weights from packed format
+        packed_weights_np = self.weight.to('CPU').realize().numpy()
         dequantized_ternary_weights = unpack_ternary_weights(packed_weights_np, self.dtype)
         
+        # Step 2: Quantize input activations to int8 (crucial step that was missing!)
+        input_quant, input_scale = self.activation_quant(x)
+        
+        # Step 3: Perform linear operation with quantized inputs and ternary weights
         if self.transposed:
             # For transposed weights, x @ W
-            # x: (..., in_features), dequantized_ternary_weights: (in_features, out_features)
-            out = x @ dequantized_ternary_weights
+            y = input_quant @ dequantized_ternary_weights
         else:
             # For non-transposed weights, x @ W.T
-            # x: (..., in_features), dequantized_ternary_weights: (out_features, in_features)
-            out = x @ dequantized_ternary_weights.T
+            y = input_quant @ dequantized_ternary_weights.T
         
-        # Apply scaling factor as a tensor operation.
-        # self.weight_scale is CPU float32. .to(out.device) moves and casts it to out's device and dtype.
-        # This operation will be part of the graph and realized with the matmul.
-        out = out * self.weight_scale.to(out.device) 
-            
-        return out
+        # Step 4: Apply proper post-quantization scaling (this was incorrect before!)
+        weight_scale = self.weight_scale.to(y.device)
+        y = self.post_quant_process(y, input_scale, weight_scale)
+        
+        return y
 
 class BitNetRMSNorm:
     """
